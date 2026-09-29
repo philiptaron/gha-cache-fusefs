@@ -96,7 +96,7 @@ The runtime token the cache service needs is only exported to actions, not
 to `run:` steps. Export it yourself, then drive the binary directly:
 
 ```yaml
-- uses: actions/github-script@v8
+- uses: actions/github-script@v9
   with:
     script: |
       core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
