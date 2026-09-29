@@ -1,6 +1,7 @@
 //! Mount the GitHub Actions cache as a FUSE filesystem. See DESIGN.md.
 
 pub mod api;
+pub mod bench;
 pub mod config;
 pub mod data;
 pub mod entry;

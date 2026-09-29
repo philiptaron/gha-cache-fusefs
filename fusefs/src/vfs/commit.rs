@@ -1,5 +1,6 @@
 //! The committer: turns pending overlay operations into cache entries.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
@@ -98,7 +99,26 @@ pub(super) async fn run(inner: Arc<Inner>) {
     }
 }
 
-/// Picks eligible operations and marks them in flight.
+/// What a due operation needs.
+enum Next {
+    Start(What),
+    /// To be looked at again this much later.
+    Later(Duration),
+    /// Nothing until something reschedules it.
+    Idle,
+    /// Nothing at all any more.
+    Stale,
+}
+
+/// How soon to look again at a file with a write landing.
+const WRITE_LANDING: Duration = Duration::from_millis(20);
+/// How soon to look again at a rename's whiteout, while the new name
+/// uploads, and while it does not.
+const RENAME_UPLOADING: Duration = Duration::from_millis(100);
+const RENAME_WAITING: Duration = Duration::from_secs(1);
+
+/// Picks due operations off the queue, marks them in flight, and says when
+/// the next one is due.
 fn collect(
     st: &mut State,
     inner: &Inner,
@@ -106,126 +126,124 @@ fn collect(
     now: Instant,
 ) -> (Vec<Job>, Option<Instant>) {
     let mut jobs = Vec::new();
-    let mut next: Option<Instant> = None;
-    let soon = |t: Instant, next: &mut Option<Instant>| {
-        if next.is_none_or(|n| t < n) {
-            *next = Some(t);
-        }
-    };
     let mut stale = Vec::new();
-    let keys: Vec<String> = st.overlay.keys().cloned().collect();
-    for key in keys {
-        if jobs.len() >= capacity {
-            break;
+    while jobs.len() < capacity {
+        match st.queue.peek() {
+            Some(Reverse((due, _))) if *due <= now => {}
+            _ => break,
         }
-        let p = &st.overlay[&key];
-        if p.inflight.is_some() || p.failed {
+        let Reverse((due, key)) = st.queue.pop().expect("peeked");
+        if !st.queued(&key, due) {
             continue;
         }
-        let Some(due) = p.due else { continue };
-        if due > now {
-            soon(due, &mut next);
-            continue;
+        match examine(st, inner, &key) {
+            Next::Start(what) => {
+                let attempt = inner.next_attempt.fetch_add(1, Ordering::Relaxed);
+                let p = st.overlay.get_mut(&key).expect("queued");
+                p.inflight = Some(attempt);
+                jobs.push(Job {
+                    op_id: p.op_id,
+                    key,
+                    attempt,
+                    what,
+                });
+            }
+            Next::Later(wait) => st.schedule(&key, Some(now + wait)),
+            Next::Idle => {}
+            Next::Stale => stale.push(key),
         }
-        let what = match p.op.clone() {
-            PendingOp::Put(ino) => {
-                let Some(node) = st.nodes.get(&ino).filter(|n| n.attached) else {
-                    stale.push(key);
-                    continue;
-                };
-                let path = st.path(ino);
-                match &node.body {
-                    Body::File(f) => {
-                        if !f.dirty || inner.cfg.keys.node_key(&path) != key {
-                            stale.push(key);
-                            continue;
-                        }
-                        if f.writes_inflight > 0 {
-                            soon(now + Duration::from_millis(20), &mut next);
-                            continue;
-                        }
-                        if f.writers > 0 && !p.force {
-                            continue;
-                        }
-                        let Content::Local(file) = &f.content else {
-                            stale.push(key);
-                            continue;
-                        };
-                        let mut meta = Meta::new(Kind::File, f.mode, f.mtime);
-                        meta.empty = f.size == 0;
-                        What::File {
-                            ino,
-                            meta,
-                            file: file.clone(),
-                            size: f.size,
-                            generation: f.generation,
-                        }
-                    }
-                    Body::Symlink(s) => match (&s.target, s.dirty) {
-                        (Some(target), true) if inner.cfg.keys.node_key(&path) == key => {
-                            What::Symlink {
-                                ino,
-                                meta: Meta::new(Kind::Symlink, 0o777, s.mtime),
-                                target: target.clone(),
-                                generation: s.generation,
-                            }
-                        }
-                        _ => {
-                            stale.push(key);
-                            continue;
-                        }
-                    },
-                    Body::Dir(d) => {
-                        if !d.children.is_empty()
-                            || d.marker.is_some()
-                            || inner.cfg.keys.dir_key(&path) != key
-                        {
-                            stale.push(key);
-                            continue;
-                        }
-                        let mut meta = Meta::new(Kind::Dir, d.mode, d.mtime);
-                        meta.empty = true;
-                        What::Marker { ino, meta }
-                    }
-                }
-            }
-            PendingOp::Delete { after } => {
-                let blocked = after
-                    .as_ref()
-                    .and_then(|k| st.overlay.get(k))
-                    .is_some_and(|q| matches!(q.op, PendingOp::Put(_)));
-                if blocked {
-                    continue;
-                }
-                if st.index.visible(&key).is_none() {
-                    // Nothing to hide (any upload we raced with was abandoned).
-                    stale.push(key);
-                    continue;
-                }
-                let mut meta = Meta::new(Kind::Whiteout, 0, SystemTime::now());
-                meta.empty = true;
-                What::Whiteout { meta }
-            }
-        };
-        let attempt = inner.next_attempt.fetch_add(1, Ordering::Relaxed);
-        let p = st.overlay.get_mut(&key).expect("present");
-        p.inflight = Some(attempt);
-        jobs.push(Job {
-            op_id: p.op_id,
-            key,
-            attempt,
-            what,
-        });
     }
     for key in stale {
         st.clear_op(&key);
         st.apply_remote(&inner.cfg, &inner.store, &key);
     }
-    if jobs.len() >= capacity && capacity > 0 {
-        // More may be eligible; a finishing job wakes us.
-        next = None;
-    }
+    // At capacity, a finishing job wakes the committer.
+    let next = if jobs.len() >= capacity {
+        None
+    } else {
+        st.next_due()
+    };
     (jobs, next)
+}
+
+/// Decides what the due op at `key` needs.
+fn examine(st: &State, inner: &Inner, key: &str) -> Next {
+    let p = &st.overlay[key];
+    match &p.op {
+        &PendingOp::Put(ino) => {
+            let Some(node) = st.nodes.get(&ino).filter(|n| n.attached) else {
+                return Next::Stale;
+            };
+            let path = st.path(ino);
+            match &node.body {
+                Body::File(f) => {
+                    if !f.dirty || inner.cfg.keys.node_key(&path) != key {
+                        return Next::Stale;
+                    }
+                    if f.writes_inflight > 0 {
+                        return Next::Later(WRITE_LANDING);
+                    }
+                    if f.writers > 0 && !p.force {
+                        // Closing the file schedules it again.
+                        return Next::Idle;
+                    }
+                    let Content::Local(file) = &f.content else {
+                        return Next::Stale;
+                    };
+                    let mut meta = Meta::new(Kind::File, f.mode, f.mtime);
+                    meta.empty = f.size == 0;
+                    Next::Start(What::File {
+                        ino,
+                        meta,
+                        file: file.clone(),
+                        size: f.size,
+                        generation: f.generation,
+                    })
+                }
+                Body::Symlink(s) => match (&s.target, s.dirty) {
+                    (Some(target), true) if inner.cfg.keys.node_key(&path) == key => {
+                        Next::Start(What::Symlink {
+                            ino,
+                            meta: Meta::new(Kind::Symlink, 0o777, s.mtime),
+                            target: target.clone(),
+                            generation: s.generation,
+                        })
+                    }
+                    _ => Next::Stale,
+                },
+                Body::Dir(d) => {
+                    if !d.children.is_empty()
+                        || d.marker.is_some()
+                        || inner.cfg.keys.dir_key(&path) != key
+                    {
+                        return Next::Stale;
+                    }
+                    let mut meta = Meta::new(Kind::Dir, d.mode, d.mtime);
+                    meta.empty = true;
+                    Next::Start(What::Marker { ino, meta })
+                }
+            }
+        }
+        PendingOp::Delete { after } => {
+            // A rename's whiteout waits for the upload of the new name.
+            if let Some(q) = after.as_ref().and_then(|k| st.overlay.get(k)) {
+                if matches!(q.op, PendingOp::Put(_)) {
+                    return Next::Later(if q.inflight.is_some() {
+                        RENAME_UPLOADING
+                    } else {
+                        RENAME_WAITING
+                    });
+                }
+            }
+            if st.index.visible(key).is_none() {
+                // Nothing to hide (any upload we raced with was abandoned).
+                return Next::Stale;
+            }
+            let mut meta = Meta::new(Kind::Whiteout, 0, SystemTime::now());
+            meta.empty = true;
+            Next::Start(What::Whiteout { meta })
+        }
+    }
 }
 
 fn still_valid(inner: &Inner, job: &Job) -> bool {
@@ -346,10 +364,16 @@ fn finish(inner: &Arc<Inner>, job: Job, result: Result<(Meta, u64, i64), Failure
         .overlay
         .get(&job.key)
         .is_some_and(|p| p.op_id == job.op_id);
-    if let Some(p) = st.overlay.get_mut(&job.key) {
-        if p.inflight == Some(job.attempt) {
+    let landed = match st.overlay.get_mut(&job.key) {
+        Some(p) if p.inflight == Some(job.attempt) => {
             p.inflight = None;
+            Some(p.due)
         }
+        _ => None,
+    };
+    if let Some(due) = landed {
+        // Anything that rescheduled the op while it was in flight lapsed.
+        st.schedule(&job.key, due);
     }
     match result {
         Ok((meta, size, id)) => {
@@ -366,12 +390,14 @@ fn finish(inner: &Arc<Inner>, job: Job, result: Result<(Meta, u64, i64), Failure
                     stats.whiteouts.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            let created = st.fresh_created(&job.key);
             let entry = RemoteEntry {
                 key: job.key.clone(),
                 version: meta.encode(),
                 meta,
                 size,
-                created: st.fresh_created(&job.key),
+                created,
+                accessed: created,
                 id,
                 scope: 0,
             };
@@ -429,6 +455,7 @@ fn finish(inner: &Arc<Inner>, job: Job, result: Result<(Meta, u64, i64), Failure
             let permanent = !e.is_transient() && e != ApiError::Expired;
             let draining = inner.draining.load(Ordering::SeqCst);
             tracing::warn!("uploading {}: {e}", job.key);
+            let mut retry = None;
             if let Some(p) = st.overlay.get_mut(&job.key) {
                 if p.op_id == job.op_id {
                     p.attempts += 1;
@@ -436,9 +463,12 @@ fn finish(inner: &Arc<Inner>, job: Job, result: Result<(Meta, u64, i64), Failure
                     if permanent || (draining && p.attempts >= inner.cfg.drain_attempts) {
                         p.failed = true;
                     } else {
-                        p.due = Some(Instant::now() + backoff(p.attempts));
+                        retry = Some(Instant::now() + backoff(p.attempts));
                     }
                 }
+            }
+            if retry.is_some() {
+                st.schedule(&job.key, retry);
             }
         }
     }

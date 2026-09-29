@@ -20,6 +20,8 @@ use crate::index::RemoteEntry;
 pub const CHUNK: u64 = 1 << 20;
 /// Largest single range request.
 const MAX_RUN_CHUNKS: u64 = 8;
+/// The same, in bytes.
+pub const RUN: u64 = MAX_RUN_CHUNKS * CHUNK;
 
 /// Resolves when an in-flight range fetch finishes.
 type Fetching = watch::Receiver<Option<Result<(), String>>>;

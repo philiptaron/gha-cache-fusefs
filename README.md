@@ -87,11 +87,14 @@ service with `actions/cache/save` and `actions/cache/restore`.
   forks) are mounted read-only.
 * The cache service's limits apply: the repository's cache quota (10 GB by
   default) and eviction after 7 days without access. Creating entries is
-  rate limited, too. In practice about 200 new files per ~30 s per
+  rate limited, too. In practice about 200 new files per ~45 s per
   repository are allowed; beyond that the daemon waits as instructed
   (`Retry-After`), so saving thousands of small files takes minutes. Pack
   them (tar, squashfs, zip) if that matters: one large file is one entry,
   and reads of it stay lazy.
+* The REST budget of `GITHUB_TOKEN` (1,000 requests an hour, per
+  repository) pays for listings: one request per 100 entries per scope at
+  every mount.
 
 ## The action
 
@@ -146,3 +149,8 @@ except the kernel adapter is tested on macOS too. `fusefs/tests/e2e.sh` runs
 real tools through the kernel; CI runs it against the fake service in a
 NixOS VM, as an unprivileged user on a runner, and across three dependent
 jobs against the real cache.
+
+[PERFORMANCE.md](fusefs/PERFORMANCE.md) analyzes what the service allows and
+what the filesystem achieves. Its benchmarks run against a model of the
+service (`nix run . -- bench`), without it (`--service local`), or against the
+real cache (the manual `fusefs-bench` workflow).

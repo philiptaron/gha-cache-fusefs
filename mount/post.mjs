@@ -24,6 +24,17 @@ function report(path, summary) {
     `| ${summary.uploaded_files} | ${human(summary.uploaded_bytes)} | ${summary.whiteouts} | ${summary.dir_markers} | ${human(summary.downloaded_bytes)} | ${summary.failures.length} |`,
     '',
   ];
+  const q = summary.requests;
+  if (q) lines.push(`Requests: ${q.cache_service} to the cache service, ${q.blob} to blob storage, ${q.rest} to the REST API.`, '');
+  if (summary.rate_limited) {
+    const paused = Math.round((summary.rate_limit_pause_ms ?? 0) / 1000);
+    lines.push(
+      `:hourglass: Rate limited ${summary.rate_limited} times, which held up uploads (or listings) for ${paused} s. ` +
+        'Every file, empty directory, and deletion is a new cache entry, and the service allows about 200 per ~45 s ' +
+        'per repository; packing small files (tar, squashfs, zip) avoids the wait.',
+      ''
+    );
+  }
   for (const f of summary.failures) lines.push(`- :x: \`${f.key}\`: ${f.error}`);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
 }

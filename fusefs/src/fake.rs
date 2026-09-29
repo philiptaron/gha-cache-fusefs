@@ -1,6 +1,8 @@
 //! A fake of the Actions cache: the three Twirp methods, SAS-style blob
 //! endpoints, and the REST list/delete endpoints, with the semantics measured
-//! against the real service (DESIGN.md §1). Used by tests and the VM test.
+//! against the real service (DESIGN.md §1). Used by tests, the VM test, and
+//! benchmarks, which can also give it the real service's latency, bandwidth,
+//! and rate limit ([`FakeConfig::hosted`]).
 //!
 //! Runtime tokens name the scopes: `fake:<write ref>:<read ref>,<read ref>` (refs
 //! cannot contain colons).
@@ -19,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::config::{CacheMode, Env};
 
@@ -31,6 +34,32 @@ pub struct FakeConfig {
     pub fail_blob_every: Option<u64>,
     /// Reject REST requests (as if `actions: read` were missing).
     pub deny_rest: bool,
+    /// How long every request takes before it is answered.
+    pub latency: Duration,
+    /// How fast blob bodies travel.
+    pub download: Option<Link>,
+    pub upload: Option<Link>,
+    /// Beyond this many `CreateCacheEntry` calls per window, answer 429.
+    pub create_limit: Option<RateLimit>,
+    /// Until then, answer REST requests as if the `GITHUB_TOKEN` budget were spent.
+    pub rest_exhausted_until: Option<SystemTime>,
+}
+
+/// Transfer rates, in bytes per second.
+#[derive(Clone, Copy, Debug)]
+pub struct Link {
+    /// For one request on its own.
+    pub per_request: u64,
+    /// For all requests together.
+    pub total: u64,
+}
+
+/// A fixed window: it opens with the first call, admits `calls`, and answers
+/// the rest with a `Retry-After` of the time until it closes.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimit {
+    pub calls: u32,
+    pub window: Duration,
 }
 
 impl Default for FakeConfig {
@@ -40,7 +69,63 @@ impl Default for FakeConfig {
             default_branch: "main".into(),
             fail_blob_every: None,
             deny_rest: false,
+            latency: Duration::ZERO,
+            download: None,
+            upload: None,
+            create_limit: None,
+            rest_exhausted_until: None,
         }
+    }
+}
+
+impl FakeConfig {
+    /// The service as measured from hosted runners (DESIGN.md §1): ~250 ms per
+    /// request; 23 MB/s per download and 52 MB/s for parallel downloads;
+    /// 84 MB/s for parallel uploads (one upload on its own was not measured,
+    /// so it is assumed to match a download); and 200 creations, then 429s
+    /// whose `Retry-After` of 30–40 s suggests a window of about 45 s.
+    pub fn hosted() -> FakeConfig {
+        FakeConfig {
+            latency: Duration::from_millis(250),
+            download: Some(Link {
+                per_request: 23_000_000,
+                total: 52_000_000,
+            }),
+            upload: Some(Link {
+                per_request: 23_000_000,
+                total: 84_000_000,
+            }),
+            create_limit: Some(RateLimit {
+                calls: 200,
+                window: Duration::from_secs(45),
+            }),
+            ..FakeConfig::default()
+        }
+    }
+}
+
+/// A link that blob transfers share. Each takes at least its size over the
+/// per-request rate, and they queue, in arrival order, for their size over
+/// the total rate. (Real links share bandwidth fairly instead; for the
+/// benchmarks, which rarely mix large and small transfers, that is close
+/// enough.)
+#[derive(Default)]
+struct Pipe {
+    free_at: Mutex<Option<Instant>>,
+}
+
+impl Pipe {
+    async fn carry(&self, link: Option<Link>, bytes: usize) {
+        let Some(link) = link else { return };
+        let time = |rate: u64| Duration::from_secs_f64(bytes as f64 / rate.max(1) as f64);
+        let now = Instant::now();
+        let queued = {
+            let mut free = self.free_at.lock();
+            let end = free.map_or(now, |f| f.max(now)) + time(link.total);
+            *free = Some(end);
+            end
+        };
+        tokio::time::sleep_until(queued.max(now + time(link.per_request))).await;
     }
 }
 
@@ -70,6 +155,36 @@ struct Inner {
     next_id: AtomicI64,
     blob_requests: AtomicU64,
     twirp_requests: AtomicU64,
+    downloads: Pipe,
+    uploads: Pipe,
+    /// When the creation window opened, and how many calls it admitted.
+    window: Mutex<(Instant, u32)>,
+}
+
+impl Inner {
+    async fn delay(&self) {
+        let latency = self.cfg.lock().latency;
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+    }
+
+    /// Counts a creation; `Some(wait)` if the window is full.
+    fn over_limit(&self) -> Option<Duration> {
+        let limit = self.cfg.lock().create_limit?;
+        let now = Instant::now();
+        let mut w = self.window.lock();
+        let (opened, calls) = &mut *w;
+        if *calls == 0 || now >= *opened + limit.window {
+            *opened = now;
+            *calls = 0;
+        }
+        if *calls >= limit.calls {
+            return Some(*opened + limit.window - now);
+        }
+        *calls += 1;
+        None
+    }
 }
 
 pub struct FakeServer {
@@ -134,6 +249,9 @@ impl FakeServer {
             next_id: AtomicI64::new(1000),
             blob_requests: AtomicU64::new(0),
             twirp_requests: AtomicU64::new(0),
+            downloads: Pipe::default(),
+            uploads: Pipe::default(),
+            window: Mutex::new((Instant::now(), 0)),
         });
         let app = Router::new()
             .route(
@@ -209,6 +327,61 @@ impl FakeServer {
         self.inner.twirp_requests.load(Ordering::Relaxed)
     }
 
+    /// Adds a finalized entry without going through the API, which is much
+    /// faster when a benchmark needs a large listing.
+    pub fn insert(&self, key: &str, version: &str, scope: &str, data: Bytes) {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now();
+        self.inner.entries.lock().push(Entry {
+            id,
+            key: key.into(),
+            version: version.into(),
+            scope: scope.into(),
+            finalized: true,
+            size: data.len() as u64,
+            created: now,
+            accessed: now,
+        });
+        self.inner.blobs.lock().insert(
+            id,
+            BlobData {
+                committed: Some(data),
+                blocks: HashMap::new(),
+            },
+        );
+    }
+
+    /// Deletes the entries with this key in `scope`, as eviction would.
+    pub fn remove(&self, key: &str, scope: &str) {
+        let mut entries = self.inner.entries.lock();
+        let mut blobs = self.inner.blobs.lock();
+        entries.retain(|e| {
+            let gone = e.finalized && e.key == key && e.scope == scope;
+            if gone {
+                blobs.remove(&e.id);
+            }
+            !gone
+        });
+    }
+
+    /// Moves every entry's creation and last use this far into the past.
+    pub fn age(&self, by: Duration) {
+        for e in self.inner.entries.lock().iter_mut() {
+            e.created -= by;
+            e.accessed -= by;
+        }
+    }
+
+    /// When an entry with this key in `scope` was last used.
+    pub fn last_used(&self, key: &str, scope: &str) -> Option<SystemTime> {
+        let entries = self.inner.entries.lock();
+        entries
+            .iter()
+            .filter(|e| e.finalized && e.key == key && e.scope == scope)
+            .map(|e| e.accessed)
+            .max()
+    }
+
     /// Serves until the process is killed (for the `fake-server` subcommand).
     pub async fn wait(mut self) {
         let _ = (&mut self.task).await;
@@ -222,6 +395,7 @@ async fn twirp(
     body: Bytes,
 ) -> Response {
     s.twirp_requests.fetch_add(1, Ordering::Relaxed);
+    s.delay().await;
     let Some((write, read)) = scopes_of(&headers) else {
         return twirp_error(StatusCode::UNAUTHORIZED, "unauthenticated", "bad token");
     };
@@ -254,6 +428,16 @@ async fn twirp(
     let now = SystemTime::now();
     match method.as_str() {
         "CreateCacheEntry" => {
+            if let Some(wait) = s.over_limit() {
+                let mut resp = twirp_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "resource_exhausted",
+                    "too many cache entries created; try again later",
+                );
+                let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+                resp.headers_mut().insert(header::RETRY_AFTER, secs.into());
+                return resp;
+            }
             let mut entries = s.entries.lock();
             if entries
                 .iter()
@@ -395,12 +579,15 @@ async fn blob_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    s.delay().await;
     if inject_failure(&s) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if !sas_ok(&q, 'w') {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let link = s.cfg.lock().upload;
+    s.uploads.carry(link, body.len()).await;
     let mut blobs = s.blobs.lock();
     let Some(blob) = blobs.get_mut(&id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -443,6 +630,7 @@ async fn blob_get(
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    s.delay().await;
     if inject_failure(&s) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -465,12 +653,16 @@ async fn blob_get(
             let (a, b) = v.split_once('-')?;
             Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()))
         });
+    let link = s.cfg.lock().download;
     match range {
-        None => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, total)
-            .body(Body::from(data))
-            .expect("valid response"),
+        None => {
+            s.downloads.carry(link, data.len()).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, total)
+                .body(Body::from(data))
+                .expect("valid response")
+        }
         Some((start, _)) if start >= total => Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{total}"))
@@ -478,19 +670,22 @@ async fn blob_get(
             .expect("valid response"),
         Some((start, end)) => {
             let end = end.unwrap_or(total - 1).min(total - 1);
+            let body = data.slice(start as usize..=end as usize);
+            s.downloads.carry(link, body.len()).await;
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(
                     header::CONTENT_RANGE,
                     format!("bytes {start}-{end}/{total}"),
                 )
-                .body(Body::from(data.slice(start as usize..=end as usize)))
+                .body(Body::from(body))
                 .expect("valid response")
         }
     }
 }
 
-fn rest_denied(s: &Inner, headers: &HeaderMap) -> Option<Response> {
+async fn rest_denied(s: &Inner, headers: &HeaderMap) -> Option<Response> {
+    s.delay().await;
     let authed = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -500,6 +695,23 @@ fn rest_denied(s: &Inner, headers: &HeaderMap) -> Option<Response> {
             (
                 StatusCode::FORBIDDEN,
                 axum::Json(json!({"message": "Resource not accessible by integration"})),
+            )
+                .into_response(),
+        );
+    }
+    let exhausted = s.cfg.lock().rest_exhausted_until;
+    if let Some(reset) = exhausted.filter(|t| *t > SystemTime::now()) {
+        let reset = reset
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                [
+                    ("x-ratelimit-remaining", "0".to_string()),
+                    ("x-ratelimit-reset", reset.as_secs().to_string()),
+                ],
+                axum::Json(json!({"message": "API rate limit exceeded"})),
             )
                 .into_response(),
         );
@@ -524,7 +736,7 @@ async fn list(
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = rest_denied(&s, &headers) {
+    if let Some(r) = rest_denied(&s, &headers).await {
         return r;
     }
     let per_page: usize = q
@@ -564,7 +776,7 @@ async fn delete_one(
     Path((_, _, id)): Path<(String, String, i64)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = rest_denied(&s, &headers) {
+    if let Some(r) = rest_denied(&s, &headers).await {
         return r;
     }
     let mut entries = s.entries.lock();
@@ -582,7 +794,7 @@ async fn delete_by_key(
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = rest_denied(&s, &headers) {
+    if let Some(r) = rest_denied(&s, &headers).await {
         return r;
     }
     let Some(key) = q.get("key") else {
@@ -602,9 +814,41 @@ async fn delete_by_key(
 }
 
 async fn repo(State(s): State<Arc<Inner>>, headers: HeaderMap) -> Response {
-    if let Some(r) = rest_denied(&s, &headers) {
+    if let Some(r) = rest_denied(&s, &headers).await {
         return r;
     }
     let default_branch = s.cfg.lock().default_branch.clone();
     axum::Json(json!({"default_branch": default_branch})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transfers_share_the_link() {
+        let pipe = Pipe::default();
+        let shared = Some(Link {
+            per_request: 10_000_000,
+            total: 1_000_000,
+        });
+        let t = Instant::now();
+        tokio::join!(pipe.carry(shared, 100_000), pipe.carry(shared, 100_000));
+        assert!(
+            t.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+        let slow = Some(Link {
+            per_request: 1_000_000,
+            total: 10_000_000,
+        });
+        let t = Instant::now();
+        pipe.carry(slow, 100_000).await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+    }
 }

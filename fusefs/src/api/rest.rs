@@ -1,5 +1,6 @@
 //! The GitHub REST API: the only way to list and delete cache entries.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use reqwest::StatusCode;
@@ -42,10 +43,19 @@ pub struct CacheItem {
 
 impl CacheItem {
     pub fn created(&self) -> SystemTime {
-        humantime::parse_rfc3339_weak(self.created_at.trim_end_matches('Z'))
-            .or_else(|_| humantime::parse_rfc3339(&self.created_at))
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+        parse_time(&self.created_at).unwrap_or(SystemTime::UNIX_EPOCH)
     }
+
+    /// When the entry was last downloaded, or else created.
+    pub fn accessed(&self) -> SystemTime {
+        parse_time(&self.last_accessed_at).unwrap_or_else(|| self.created())
+    }
+}
+
+fn parse_time(t: &str) -> Option<SystemTime> {
+    humantime::parse_rfc3339_weak(t.trim_end_matches('Z'))
+        .or_else(|_| humantime::parse_rfc3339(t))
+        .ok()
 }
 
 #[derive(Deserialize)]
@@ -102,6 +112,7 @@ impl Rest {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<bytes::Bytes, ApiError> {
+        self.http.stats.rest.fetch_add(1, Ordering::Relaxed);
         let resp = req.send().await.map_err(ApiError::transport)?;
         let status = resp.status();
         let headers = resp.headers().clone();

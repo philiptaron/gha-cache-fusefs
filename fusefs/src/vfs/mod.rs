@@ -15,10 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
-use crate::api::Api;
-use crate::data::{CHUNK, DataFile, DataStore, RemoteData};
+use crate::api::{Api, Requests};
+use crate::data::{CHUNK, DataFile, DataStore, RUN, RemoteData};
 use crate::entry::{KeySpace, MAX_KEY_LEN, join, valid_component};
 use crate::index::{self, Index};
 
@@ -36,6 +36,8 @@ impl std::fmt::Display for Errno {
         write!(f, "{}", std::io::Error::from_raw_os_error(self.0))
     }
 }
+
+impl std::error::Error for Errno {}
 
 pub type Result<T> = std::result::Result<T, Errno>;
 
@@ -160,6 +162,7 @@ pub struct Failure {
 
 /// What happened during a mount, written at unmount.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Summary {
     pub uploaded_files: u64,
     pub uploaded_bytes: u64,
@@ -168,6 +171,14 @@ pub struct Summary {
     pub download_requests: u64,
     pub downloaded_bytes: u64,
     pub gc_deleted: u64,
+    /// Entries kept from expiring because nothing else would use them (see
+    /// `Vfs::touch_stale`).
+    pub touched: u64,
+    pub requests: Requests,
+    /// Responses that asked us to slow down (429, or an exhausted REST quota).
+    pub rate_limited: u64,
+    /// How long those responses paused requests of their kind, in total.
+    pub rate_limit_pause_ms: u64,
     pub failures: Vec<Failure>,
 }
 
@@ -178,6 +189,7 @@ struct Stats {
     whiteouts: AtomicU64,
     dir_markers: AtomicU64,
     gc_deleted: AtomicU64,
+    touched: AtomicU64,
 }
 
 struct Inner {
@@ -189,7 +201,8 @@ struct Inner {
     wake: Notify,
     /// Signalled whenever a commit attempt finishes.
     done: Notify,
-    refresh_lock: tokio::sync::Mutex<()>,
+    /// The refresh under way, if any; it resolves to whether it worked.
+    refreshing: Mutex<Option<watch::Receiver<Option<bool>>>>,
     stats: Stats,
     draining: AtomicBool,
     next_attempt: AtomicU64,
@@ -225,7 +238,47 @@ impl Vfs {
             cfg.keys.prefix(),
             index.scopes()
         );
-        Ok(Vfs::with_index(cfg, api, store, index))
+        let vfs = Vfs::with_index(cfg, api, store, index);
+        vfs.touch_stale();
+        Ok(vfs)
+    }
+
+    /// The service expires entries a week after their last download, and
+    /// nothing ever downloads a whiteout, a directory marker, or an empty
+    /// file. Left alone, deletions would come back and empty files and
+    /// directories would vanish from trees in daily use. So a mount resolves
+    /// a download URL, which counts as use, for those it depends on that have
+    /// not been used for a while.
+    fn touch_stale(&self) {
+        let stale = {
+            let st = self.0.st.lock();
+            let cutoff = SystemTime::now()
+                .checked_sub(TOUCH_AFTER)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            st.index.unused_dependencies(cutoff, TOUCH_MAX)
+        };
+        if stale.is_empty() {
+            return;
+        }
+        tracing::debug!("touching {} entries nothing reads", stale.len());
+        let vfs = self.clone();
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            futures_util::stream::iter(stale)
+                .for_each_concurrent(TOUCH_CONCURRENCY, |e| {
+                    let vfs = vfs.clone();
+                    async move {
+                        match vfs.0.api.twirp.download_url(&e.key, &e.version).await {
+                            Ok(Some(_)) => {
+                                vfs.0.stats.touched.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(None) => tracing::debug!("{}: gone before it was touched", e.key),
+                            Err(err) => tracing::debug!("touching {}: {err}", e.key),
+                        }
+                    }
+                })
+                .await;
+        });
     }
 
     pub fn with_index(cfg: VfsConfig, api: Api, store: Arc<DataStore>, index: Index) -> Vfs {
@@ -240,7 +293,7 @@ impl Vfs {
             st: Mutex::new(st),
             wake: Notify::new(),
             done: Notify::new(),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            refreshing: Mutex::new(None),
             stats: Stats::default(),
             draining: AtomicBool::new(false),
             next_attempt: AtomicU64::new(1),
@@ -301,26 +354,42 @@ impl Vfs {
         Ok(st.child(parent, name).map(|ino| st.attr(&self.0.cfg, ino)))
     }
 
-    /// Refreshes if the last refresh is older than the configured interval.
+    /// Refreshes if the last refresh is older than the configured interval,
+    /// and returns whether a refresh finished. One refresh runs at a time, in
+    /// the background: a lookup waits for it at most `REFRESH_WAIT`, and a
+    /// slow listing only delays what it finds.
     async fn maybe_refresh(&self) -> bool {
         let Some(interval) = self.0.cfg.refresh else {
             return false;
         };
-        if self.0.st.lock().last_refresh.elapsed() < interval {
-            return false;
-        }
-        let _guard = self.0.refresh_lock.lock().await;
-        if self.0.st.lock().last_refresh.elapsed() < interval {
-            // Someone else refreshed while we waited.
-            return true;
-        }
-        match self.refresh().await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("refresh failed: {e}");
-                false
+        let mut done = {
+            let mut refreshing = self.0.refreshing.lock();
+            match &*refreshing {
+                Some(rx) => rx.clone(),
+                None => {
+                    if self.0.st.lock().last_refresh.elapsed() < interval {
+                        return false;
+                    }
+                    let (tx, rx) = watch::channel(None);
+                    *refreshing = Some(rx.clone());
+                    let vfs = self.clone();
+                    tokio::spawn(async move {
+                        let ok = match vfs.refresh().await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!("refresh failed: {e:#}");
+                                false
+                            }
+                        };
+                        *vfs.0.refreshing.lock() = None;
+                        let _ = tx.send(Some(ok));
+                    });
+                    rx
+                }
             }
-        }
+        };
+        let finished = tokio::time::timeout(REFRESH_WAIT, done.wait_for(Option::is_some)).await;
+        matches!(finished, Ok(Ok(ok)) if *ok == Some(true))
     }
 
     /// Picks up entries created since the last listing.
@@ -542,7 +611,17 @@ impl Vfs {
             }
             Content::Remote(rd) => {
                 if ahead > 0 {
-                    rd.prefetch(&self.0.api, offset + size as u64, ahead);
+                    // What this read needs goes first, in a request of its
+                    // own. Then the window is topped up to a whole run:
+                    // sliding it one read at a time would fetch a chunk per
+                    // request.
+                    let from = offset + size as u64;
+                    let mut to = from + ahead;
+                    if to < rd.size() && to / RUN * RUN > from {
+                        to = to / RUN * RUN;
+                    }
+                    rd.prefetch(&self.0.api, offset, size as u64);
+                    rd.prefetch(&self.0.api, from, to - from);
                 }
                 rd.read(&self.0.api, offset, size as u64)
                     .await
@@ -629,9 +708,8 @@ impl Vfs {
                 return Ok(());
             }
             let key = self.0.cfg.keys.node_key(&st.path(ino));
-            let p = st.overlay.get_mut(&key).ok_or(EIO)?;
-            p.force = true;
-            p.due = Some(Instant::now());
+            st.overlay.get_mut(&key).ok_or(EIO)?.force = true;
+            st.schedule(&key, Some(Instant::now()));
             key
         };
         self.0.wake.notify_one();
@@ -904,6 +982,9 @@ impl Vfs {
             self.0.wake.notify_one();
             // Also re-check periodically, in case an attempt's due time passes.
             let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
+            // Each check walks every pending op, and uploads finish every few
+            // milliseconds; checking after each one would be quadratic.
+            tokio::time::sleep(DRAIN_CHECK).await;
         }
         self.summary()
     }
@@ -911,6 +992,7 @@ impl Vfs {
     pub fn summary(&self) -> Summary {
         let st = self.0.st.lock();
         let s = &self.0.stats;
+        let api = &self.0.api.stats;
         Summary {
             uploaded_files: s.uploaded_files.load(Ordering::Relaxed),
             uploaded_bytes: s.uploaded_bytes.load(Ordering::Relaxed),
@@ -919,6 +1001,10 @@ impl Vfs {
             download_requests: self.0.store.stats.requests.load(Ordering::Relaxed),
             downloaded_bytes: self.0.store.stats.bytes.load(Ordering::Relaxed),
             gc_deleted: s.gc_deleted.load(Ordering::Relaxed),
+            touched: s.touched.load(Ordering::Relaxed),
+            requests: api.requests(),
+            rate_limited: api.rate_limited.load(Ordering::Relaxed),
+            rate_limit_pause_ms: api.paused_ms.load(Ordering::Relaxed),
             failures: st
                 .overlay
                 .iter()
@@ -946,6 +1032,18 @@ const READAHEAD_MAX: u64 = 64 * CHUNK;
 const PREFETCH_MAX_SIZE: u64 = CHUNK;
 const PREFETCH_MAX_FILES: usize = 256;
 const PREFETCH_CONCURRENCY: usize = 6;
+
+/// How long a lookup of a missing name waits for the refresh it starts.
+const REFRESH_WAIT: Duration = Duration::from_secs(2);
+
+/// How often an unmount checks whether everything is done.
+const DRAIN_CHECK: Duration = Duration::from_millis(20);
+
+/// Touching entries nothing reads: those last used this long ago, at most
+/// this many per mount (the stalest first), this many at once.
+const TOUCH_AFTER: Duration = Duration::from_secs(3 * 24 * 3600);
+const TOUCH_MAX: usize = 1000;
+const TOUCH_CONCURRENCY: usize = 4;
 
 impl Handle {
     fn new(ino: Ino, content: Content, writable: bool) -> Handle {
