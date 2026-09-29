@@ -375,7 +375,8 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 ## 10. Future work
 
 * Packing small files into shared entries, to get past the ~200 creations
-  per 40–50 s that the service allows (see PERFORMANCE.md).
+  per 40–50 s that the service allows (see PERFORMANCE.md). The proposed
+  format is [LAYERS.md](LAYERS.md): EROFS images stacked like overlayfs.
 * Lazy copy-on-write: opening a remote file read-write downloads it at once,
   even if nothing is written.
 * A read-only view of foreign entries (for example `actions/cache` archives).
