@@ -1,0 +1,164 @@
+name: fusefs
+
+on:
+  push:
+    branches: [main, fusefs]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  # The mount lists cache entries through the REST API; cleanup deletes them.
+  actions: write
+  contents: read
+
+env:
+  # Each run writes below its own directory of the mount.
+  RUN: e2e/${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build:
+    name: Build the static binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix build --print-build-logs .#static
+      - run: |
+          cp result/bin/gha-cache-fusefs .
+          file gha-cache-fusefs
+          ./gha-cache-fusefs --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gha-cache-fusefs
+          path: gha-cache-fusefs
+          if-no-files-found: error
+
+  check:
+    name: nix flake check (tests, clippy, rustfmt, NixOS VM test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Let the runner user use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix flake check --print-build-logs
+
+  fake:
+    name: FUSE against the fake cache service
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: gha-cache-fusefs
+          path: bin
+      - run: |
+          chmod +x bin/gha-cache-fusefs
+          sudo apt-get install -y squashfuse >/dev/null
+      - name: Write, read, and verify as an unprivileged user
+        run: |
+          bin/gha-cache-fusefs fake-server --env-file "$RUNNER_TEMP/fake.env" >"$RUNNER_TEMP/fake.log" 2>&1 &
+          for _ in $(seq 100); do [ -s "$RUNNER_TEMP/fake.env" ] && break; sleep 0.1; done
+          set -a
+          . "$RUNNER_TEMP/fake.env"
+          set +a
+          export BIN=$PWD/bin/gha-cache-fusefs MNT=$RUNNER_TEMP/cache RUN=fake
+          for phase in write read verify; do bash fusefs/tests/e2e.sh "$phase"; done
+      - name: Logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/gha-cache-fusefs/*/daemon.log "$RUNNER_TEMP/fake.log"; do
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+
+  e2e-write:
+    name: "Real cache 1/3: write"
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: gha-cache-fusefs
+          path: bin
+      - run: chmod +x bin/gha-cache-fusefs
+      - uses: ./mount
+        with:
+          path: /mnt/cache
+          binary: bin/gha-cache-fusefs
+          settle: 200ms
+          log: info,gha_cache_fusefs=debug
+      - run: bash fusefs/tests/e2e.sh write
+        env:
+          MNT: /mnt/cache
+          EXTERNAL_MOUNT: 1
+
+  e2e-read:
+    name: "Real cache 2/3: read and modify"
+    needs: e2e-write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: gha-cache-fusefs
+          path: bin
+      - run: |
+          chmod +x bin/gha-cache-fusefs
+          sudo apt-get install -y squashfuse >/dev/null
+      - uses: ./mount
+        with:
+          path: /mnt/cache
+          binary: bin/gha-cache-fusefs
+          settle: 200ms
+          log: info,gha_cache_fusefs=debug
+      - run: bash fusefs/tests/e2e.sh read
+        env:
+          MNT: /mnt/cache
+          EXTERNAL_MOUNT: 1
+
+  e2e-verify:
+    name: "Real cache 3/3: verify and remove"
+    needs: e2e-read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: gha-cache-fusefs
+          path: bin
+      - run: chmod +x bin/gha-cache-fusefs
+      - uses: ./mount
+        with:
+          path: /mnt/cache
+          binary: bin/gha-cache-fusefs
+          settle: 200ms
+          log: info,gha_cache_fusefs=debug
+      - run: bash fusefs/tests/e2e.sh verify
+        env:
+          MNT: /mnt/cache
+          EXTERNAL_MOUNT: 1
+
+  e2e-cleanup:
+    name: Delete this run's cache entries
+    needs: [e2e-write, e2e-read, e2e-verify]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=fusefs/$RUN/&per_page=100" --jq '.actions_caches[].id')
+          n=0
+          for id in $ids; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null && n=$((n + 1))
+          done
+          echo "deleted $n entries"
