@@ -170,10 +170,11 @@ and resolves every key with two rules:
 
 If the winner is a whiteout, the key does not exist. Deleting on a feature
 branch hides the default branch's file on that branch only, which is how
-overlayfs behaves and how cache scoping already works. When the token has
-`actions: write`, entries in the current scope that a newer write superseded
-are deleted in the background (whiteouts are still needed while lower scopes
-contain the key).
+overlayfs behaves and how cache scoping already works. With `--gc` (and a
+token with `actions: write`), entries in the current scope that a newer write
+superseded are deleted in the background. It is off by default: another job
+may still be reading an old version, and unread garbage is what the cache's
+LRU eviction removes first anyway.
 
 A file entry and a directory can collide, for example when two jobs write
 `a` and `a/b` concurrently. The directory wins and the file is hidden.
@@ -206,10 +207,13 @@ A file entry and a directory can collide, for example when two jobs write
   `Result<_, errno>`, and the tests drive it without a kernel.
 * **`data`** manages local backing files. For content we wrote, the backing
   file is authoritative. For remote content, it is a sparse cache with a 1 MiB
-  presence bitmap. Clean files are evicted LRU above `--cache-size`.
+  presence bitmap. Clean files are evicted LRU above `--cache-size-mb`.
 * **`commit`** runs the upload pipeline.
-* **`fuse`** is a thin `fuser::Filesystem` adapter. Each request is answered
-  from a tokio task, so a slow download never stalls the event loop.
+* **`fuse`** is a thin `fuser::Filesystem` adapter. Requests that stay in
+  memory or on local disk (`getattr`, `readdir`, `write`, `create`, …) are
+  answered on the FUSE thread; any that may touch the network (`lookup`,
+  `open`, `read`, `setattr`, `rename`, `fsync`) are answered from a tokio
+  task, so a slow download never stalls the event loop.
 
 ## 5. Write path
 
@@ -282,7 +286,8 @@ changing it means writing a new entry.
 | `rename` | Free if the source's content is local (pending, or cached in full): the target gets a `Put`, the source a whiteout that waits for it. Directories rename if their subtree is purely local. Otherwise `EXDEV`, so `mv` falls back to copy + unlink. `RENAME_NOREPLACE` is honored; `RENAME_EXCHANGE` is `EINVAL`. |
 | `symlink` / `readlink` | Supported; the target is the blob, cached after the first read. |
 | `chmod`, `utimens` | Stored in the version (copy-on-write for remote files). `chown` is accepted and ignored; ownership is always the mounting user. |
-| `link`, `mknod` (non-regular), xattrs | `EPERM` / `ENOTSUP`. |
+| `link`, `mknod` (non-regular) | `EPERM`. |
+| xattrs | `ENOSYS`, so the kernel stops asking (and skips its per-write `security.capability` check); programs see `EOPNOTSUPP`. |
 | `statfs` | Capacity is the repository cache quota; "used" is the sum of listed entries. |
 
 ## 8. Deployment
@@ -305,7 +310,9 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 * Runner tokens are only visible to actions, not to `run:` steps. The
   `mount/` action (a dependency-free `node24` action next to this repository's
   `restore/` and `save/`) passes them to the daemon in `main` and unmounts in
-  `post`:
+  `post`, which also writes a job summary. It finds the binary in the
+  `binary` input, the release for its ref (published by `fusefs-release`),
+  or builds it from its own checkout with Nix or with the runner's cargo:
 
   ```yaml
   permissions:
@@ -321,29 +328,39 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 ## 9. Testing
 
 * **Unit tests** cover the version codec, key/path mapping, scope merging,
-  chunk coalescing, and readahead policy.
+  error classification, and the parsing of listings and SAS expiries.
 * **A fake cache service** (`gha-cache-fusefs fake-server`) implements the
   three Twirp methods, SAS-style blob endpoints (Put Blob/Block/BlockList,
-  ranged GET/HEAD, expiring URLs), and the REST list/delete endpoints, with
-  the probe's observed semantics: prefix fallback, 409s, size validation,
-  size ≥ 1, 64-character versions, and scopes encoded in the fake token. It
-  lets the whole stack run offline.
-* **Integration tests** drive the `Vfs` core against the fake service. They
-  cover multi-"job" persistence, overwrite, whiteouts across scopes, rename,
-  symlinks, empty files, multi-block files, readahead, URL expiry, and
-  retries.
-* **A NixOS VM test** (`nix flake check`) mounts the real FUSE filesystem
-  against the fake service and runs coreutils, tar, rsync, squashfuse, and
-  `nix copy` workloads, including a remount to check persistence.
-* **End-to-end on GitHub Actions**: one job writes through the mount, a
-  dependent job mounts and verifies (including lazily mounting a squashfs
-  image stored in the cache), and a final job deletes the test prefix.
+  ranged GET/HEAD, expiring URLs, injectable 503s), and the REST list/delete
+  endpoints, with the probe's observed semantics: prefix fallback, 409s,
+  size validation, size ≥ 1, 64-character versions, and scopes encoded in the
+  fake token. It lets the whole stack run offline.
+* **Integration tests** drive the `Vfs` core against the fake service, one
+  "job" after another. They cover persistence, overwrite, copy-on-write,
+  whiteouts across branch scopes, the three kinds of rename (pending, cached,
+  `EXDEV`), directory markers, symlinks, empty files, metadata, block
+  uploads, ranged reads, injected failures, `fsync`, refresh on lookup miss,
+  `readdir` snapshots, unlinked-but-open files, and sibling prefetch.
+* **[`tests/e2e.sh`](tests/e2e.sh)** runs real tools through the kernel in
+  three phases, each a fresh mount: write (coreutils, `cp -a`, `tar -x`,
+  `rsync`, `dd`, `mksquashfs`, exec, write-then-rename), read and modify
+  (checksums, random reads, a squashfs image mounted with `squashfuse`
+  straight out of the cache, `mv`/`chmod`/append on remote files, `rm -r`),
+  and verify and remove. CI runs it three ways: in a NixOS VM against the
+  fake service (`nix flake check`), on a runner as the unprivileged user
+  against the fake service, and across three dependent jobs against the real
+  cache. A final job deletes what the run created.
 
 ## 10. Future work
 
+* Packing small files into shared entries, to get past the ~200 creations
+  per half minute that the service allows.
+* Lazy copy-on-write: opening a remote file read-write downloads it at once,
+  even if nothing is written.
 * A read-only view of foreign entries (for example `actions/cache` archives).
 * Kernel passthrough (`FOPEN_PASSTHROUGH`) for fully-local files when running
   as root.
 * A control socket (`gha-cache-fusefs sync`) for mid-job checkpoints across
   the whole mount.
-* Using the mount as a Nix binary cache for this repository's own CI.
+* Using the mount as a Nix binary cache for this repository's own CI, whose
+  builds currently compile every crate from scratch.
