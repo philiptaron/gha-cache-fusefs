@@ -33,6 +33,10 @@ pub enum ApiError {
     RateLimited(Option<Duration>),
     #[error("server error: {0}")]
     Server(String),
+    /// Reading or writing local data failed, such as a full disk; worth
+    /// retrying once space is freed.
+    #[error("local I/O error: {0}")]
+    Local(String),
     #[error("transport error: {0}")]
     Transport(String),
     /// A SAS URL was rejected, typically because it expired.
@@ -45,7 +49,10 @@ impl ApiError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            ApiError::RateLimited(_) | ApiError::Server(_) | ApiError::Transport(_)
+            ApiError::RateLimited(_)
+                | ApiError::Server(_)
+                | ApiError::Transport(_)
+                | ApiError::Local(_)
         )
     }
 

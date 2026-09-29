@@ -102,19 +102,26 @@ async function main() {
   const args = [
     'mount', path, '--daemon',
     '--state-dir', stateDir,
-    '--prefix', input('prefix', 'fusefs/'),
     '--settle', input('settle', '1s'),
     '--cache-size-mb', input('cache-size-mb', '8192'),
     '--log', input('log', 'info'),
   ];
   if (bool('read-only')) args.push('--read-only');
-  if (bool('gc')) args.push('--gc');
   // Save state first: even a failed mount should be looked at by post.
   setState('path', path);
   setState('binary', bin);
   setState('state-dir', stateDir);
   setOutput('state-dir', stateDir);
-  const r = run(bin, args, { env: { ...process.env, GITHUB_TOKEN: input('token') } });
+  // The volume and root go in the environment rather than as flags: a binary
+  // from before volumes existed, such as an older release, ignores them
+  // instead of refusing to start.
+  const env = {
+    ...process.env,
+    GITHUB_TOKEN: input('token'),
+    GHA_CACHE_FUSEFS_VOLUME: input('volume', 'default'),
+    GHA_CACHE_FUSEFS_ROOT: input('root', ''),
+  };
+  const r = run(bin, args, { env });
   if (r.status !== 0) throw new Error(`mounting failed (exit ${r.status}); see ${stateDir}/daemon.log`);
 }
 

@@ -19,10 +19,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Each run writes below its own directory of the mount, and each chain of
-  # jobs below its own subdirectory ($RUN/e2e, $RUN/interop, $RUN/action-N):
-  # the e2e phases rm -rf their directory, and a whiteout from one job
-  # rightly hides another job's file.
+  # Each run mounts a volume of its own, which cleanup deletes. Within it,
+  # each chain of jobs writes below its own directory ($RUN/e2e, $RUN/interop,
+  # $RUN/action-N): the e2e phases rm -rf their directory, and a whiteout from
+  # one job rightly hides another job's file.
+  VOLUME: ci-${{ github.run_id }}-${{ github.run_attempt }}
   RUN: e2e/${{ github.run_id }}-${{ github.run_attempt }}
 
 # The real-cache jobs need a writable cache and `actions: write`, which pull
@@ -108,6 +109,7 @@ jobs:
       - uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           settle: 200ms
           log: info,gha_cache_fusefs=debug
@@ -133,6 +135,7 @@ jobs:
       - uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           settle: 200ms
           log: info,gha_cache_fusefs=debug
@@ -156,6 +159,7 @@ jobs:
       - uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           settle: 200ms
           log: info,gha_cache_fusefs=debug
@@ -182,12 +186,14 @@ jobs:
       - uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           release: ${{ matrix.release }}
       - name: A second mount in the same job reuses the download
         if: matrix.release != ''
         uses: ./mount
         with:
           path: /mnt/cache2
+          volume: ${{ env.VOLUME }}
           release: ${{ matrix.release }}
           read-only: true
       - name: Smoke test
@@ -202,10 +208,10 @@ jobs:
           df -h /mnt/cache
           if mountpoint -q /mnt/cache2; then ls -la /mnt/cache2; fi
 
-  # Interop with actions/cache. An entry that actions/cache saves under the
-  # filesystem's prefix must stay invisible to the mount, and actions/cache
-  # must not restore what the mount wrote, not even through restore-keys
-  # prefix matching.
+  # Interop with actions/cache. An entry that actions/cache saves among the
+  # volume's keys must stay invisible to the mount, and actions/cache must
+  # not restore what the mount wrote, not even through restore-keys prefix
+  # matching.
   interop-write:
     name: "Interop 1/2: actions/cache saves, the filesystem looks"
     needs: build
@@ -221,10 +227,10 @@ jobs:
           chmod +x bin/gha-cache-fusefs
           mkdir interop-src
           echo "saved by actions/cache" >interop-src/file
-      - name: actions/cache saves under the filesystem's prefix
+      - name: actions/cache saves among the volume's keys
         uses: actions/cache/save@v6
         with:
-          key: fusefs/${{ env.RUN }}/interop/from-actions-cache
+          key: gha-fs/${{ env.VOLUME }}/interop-from-actions-cache
           path: interop-src
       - name: actions/cache saves elsewhere
         uses: actions/cache/save@v6
@@ -235,6 +241,7 @@ jobs:
         uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           settle: 200ms
       - name: The filesystem lists the foreign entry but does not show it
@@ -261,28 +268,30 @@ jobs:
           name: gha-cache-fusefs
           path: bin
       - run: chmod +x bin/gha-cache-fusefs
-      - name: actions/cache asks for the key the filesystem wrote
+      - name: actions/cache prefix-matches the layers the filesystem wrote
         id: theirs
         uses: actions/cache/restore@v6
         with:
-          key: fusefs/${{ env.RUN }}/interop/from-fusefs
+          key: interop-miss-${{ env.RUN }}
+          restore-keys: gha-fs/${{ env.VOLUME }}/layer/
           path: interop-src
-      - name: actions/cache prefix-matches the whole run directory
+      - name: actions/cache prefix-matches the whole volume
         id: prefix
         uses: actions/cache/restore@v6
         with:
           key: interop-miss-${{ env.RUN }}
-          restore-keys: fusefs/${{ env.RUN }}/
+          restore-keys: gha-fs/${{ env.VOLUME }}/
           path: interop-src
       - name: actions/cache restores its own entry
         id: own
         uses: actions/cache/restore@v6
         with:
-          key: fusefs/${{ env.RUN }}/interop/from-actions-cache
+          key: gha-fs/${{ env.VOLUME }}/interop-from-actions-cache
           path: interop-src
       - uses: ./mount
         with:
           path: /mnt/cache
+          volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           read-only: true
       - name: Each side sees only its own entries
@@ -294,7 +303,7 @@ jobs:
         run: |
           set -x
           [ "$THEIRS_HIT" != true ] && [ -z "$THEIRS_MATCHED" ]
-          [ "$PREFIX_MATCHED" = "fusefs/$RUN/interop/from-actions-cache" ]
+          [ "$PREFIX_MATCHED" = "gha-fs/$VOLUME/interop-from-actions-cache" ]
           [ "$OWN_HIT" = true ] && [ "$(cat interop-src/file)" = "saved by actions/cache" ]
           [ "$(cat "/mnt/cache/$RUN/interop/from-fusefs")" = "written through the mount" ]
           [ ! -e "/mnt/cache/$RUN/interop/from-actions-cache" ]
@@ -309,9 +318,11 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=fusefs/$RUN/&per_page=100" --jq '.actions_caches[].id')
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=gha-fs/$VOLUME/&per_page=100" --jq '.actions_caches[].id')
           ids="$ids $(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=interop-$RUN&per_page=100" --jq '.actions_caches[].id')"
-          # Emptying e2e/ leaves a marker for it, which POSIX semantics require.
+          # A binary from before volumes (the main-latest release, until it
+          # is rebuilt with them) writes format 1 under fusefs/ instead.
+          ids="$ids $(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=fusefs/$RUN/&per_page=100" --jq '.actions_caches[].id')"
           ids="$ids $(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=fusefs/e2e/&per_page=100" --jq '.actions_caches[] | select(.key == "fusefs/e2e/") | .id')"
           n=0
           for id in $ids; do

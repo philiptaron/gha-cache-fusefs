@@ -5,9 +5,13 @@ inputs:
   path:
     description: 'Where to mount the cache. Created if missing.'
     required: true
-  prefix:
-    description: 'The cache key prefix that the mount root corresponds to'
-    default: 'fusefs/'
+  volume:
+    description: 'The filesystem to mount. Its cache entries have keys starting with `gha-fs/<volume>/`; use 1 to 64 of A-Z, a-z, 0-9, `.`, `_`, and `-`.'
+    default: 'default'
+    required: false
+  root:
+    description: 'The directory of the volume to show at `path`, such as `builds/linux`. Empty for all of it.'
+    default: ''
     required: false
   read-only:
     description: 'Mount read-only. Runs whose cache token is read-only are always mounted read-only.'
@@ -16,10 +20,6 @@ inputs:
   token:
     description: 'Token for listing cache entries through the REST API; it needs `actions: read`'
     default: ${{ github.token }}
-    required: false
-  gc:
-    description: 'Delete entries that newer writes superseded; the token then needs `actions: write`'
-    default: 'false'
     required: false
   settle:
     description: 'How long a closed file waits before it is uploaded'

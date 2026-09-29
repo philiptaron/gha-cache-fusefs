@@ -2,8 +2,9 @@ name: fusefs-bench
 
 # Runs the benchmarks of fusefs/PERFORMANCE.md against the real cache, and
 # against the model of it that the fake service implements, so the two can be
-# compared. Manual only: a full run creates about 2,500 entries, and the
-# entry-creation rate limit is shared by every job in the repository.
+# compared. Manual only: a full run creates a few hundred entries, most of
+# them in the scenario that sets out to hit the rate limit, and that limit is
+# shared by every job in the repository.
 on:
   workflow_dispatch:
     inputs:
