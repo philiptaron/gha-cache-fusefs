@@ -142,20 +142,24 @@ metadata of every layer. The layers stack as entries do in format 1
    run's own ref;
 2. within a scope, by `(created_at, id)`.
 
-The merged tree follows overlayfs, walking each path's layers from the
-top:
+The merged tree is what applying the layers in that order gives, the way
+container runtimes apply image layers:
 
-* The topmost layer that has the path decides what it is.
-* A file, symlink, or whiteout there hides whatever the path is in the
-  layers below, including a whole directory. A whiteout means the path is
-  absent.
-* A directory there merges with the directories at that path in the layers
-  below, down to the first layer where the path is not a directory.
-* A merged directory takes its attributes from the topmost layer that
-  marks it `keep` or `attrs`. If no layer does, it takes them from the
-  topmost layer that passes through it.
-* A merged directory exists if the topmost layer marking it `keep` or
-  `drop` says `keep`, or if anything below it exists.
+* A file or symlink replaces whatever was at its path, including a whole
+  directory.
+* A whiteout removes a file or symlink at its path, but leaves a directory
+  alone. Whiteouts are only ever written for non-directories, so a
+  directory at that path came from another writer.
+* A directory merges with a directory already at its path, and replaces a
+  file or symlink.
+* A directory's attributes come from the last layer that marks it `keep`
+  or `attrs`. If no layer does, they come from the last layer that has
+  it.
+* A directory exists if the last layer to mark it `keep` or `drop` said
+  `keep`, or if anything below it exists.
+
+That differs from overlayfs in one place, on purpose: an overlayfs
+whiteout hides a directory too.
 
 A file that refers to a blob missing from the listing, because it was
 evicted, is absent as well.
