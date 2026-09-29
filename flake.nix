@@ -74,6 +74,7 @@
           packages = [
             pkgs.cargo
             pkgs.clippy
+            pkgs.erofs-utils
             pkgs.rustc
             pkgs.rustfmt
             pkgs.rust-analyzer
