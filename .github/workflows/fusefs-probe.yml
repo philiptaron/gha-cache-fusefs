@@ -1,0 +1,25 @@
+name: fusefs-probe
+
+# Re-measures the cache service behaviour that DESIGN.md §1 relies on.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Export the runtime token to run steps
+        uses: actions/github-script@v9
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL', 'ACTIONS_CACHE_SERVICE_V2', 'ACTIONS_CACHE_MODE']) {
+              if (process.env[k] !== undefined) core.exportVariable(k, process.env[k])
+            }
+      - run: bash fusefs/probe/probe.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

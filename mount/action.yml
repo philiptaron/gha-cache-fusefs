@@ -1,0 +1,54 @@
+name: 'Mount Cache'
+description: 'Mount the GitHub Actions cache as a filesystem with FUSE. Reads are lazy; writes are uploaded when the job ends.'
+author: 'Philip Taron'
+inputs:
+  path:
+    description: 'Where to mount the cache. Created if missing.'
+    required: true
+  prefix:
+    description: 'The cache key prefix that the mount root corresponds to'
+    default: 'fusefs/'
+    required: false
+  read-only:
+    description: 'Mount read-only. Runs whose cache token is read-only are always mounted read-only.'
+    default: 'false'
+    required: false
+  token:
+    description: 'Token for listing cache entries through the REST API; it needs `actions: read`'
+    default: ${{ github.token }}
+    required: false
+  gc:
+    description: 'Delete entries that newer writes superseded; the token then needs `actions: write`'
+    default: 'false'
+    required: false
+  settle:
+    description: 'How long a closed file waits before it is uploaded'
+    default: '1s'
+    required: false
+  cache-size-mb:
+    description: 'Local disk budget for cached remote content, in MiB'
+    default: '8192'
+    required: false
+  binary:
+    description: 'Path to a gha-cache-fusefs binary. If empty, the release matching this action''s ref is downloaded, or else the binary is built from the action''s source with Nix or cargo.'
+    default: ''
+    required: false
+  fail-on-error:
+    description: 'Fail the job if any change could not be saved when unmounting'
+    default: 'true'
+    required: false
+  log:
+    description: 'Daemon log filter, such as `info` or `gha_cache_fusefs=debug`'
+    default: 'info'
+    required: false
+outputs:
+  state-dir:
+    description: 'Directory holding the daemon log and the unmount summary'
+runs:
+  using: 'node24'
+  main: 'main.mjs'
+  post: 'post.mjs'
+  post-if: 'always()'
+branding:
+  icon: 'hard-drive'
+  color: 'gray-dark'

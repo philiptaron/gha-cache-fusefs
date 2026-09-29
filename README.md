@@ -1,5 +1,12 @@
 # Cache action
 
+> [!NOTE]
+> This fork adds [**gha-cache-fusefs**](fusefs/README.md), which mounts the
+> GitHub Actions cache as a filesystem with FUSE:
+> `uses: philiptaron/gha-cache-fusefs/mount@main` with `path: /mnt/cache`.
+> See [fusefs/README.md](fusefs/README.md) and [fusefs/DESIGN.md](fusefs/DESIGN.md).
+> The upstream action below is unchanged.
+
 This action allows caching dependencies and build outputs to improve workflow execution time.
 
 >Two other actions are available in addition to the primary `cache` action:

@@ -1,0 +1,61 @@
+name: fusefs-release
+
+# Publishes static binaries for the mount action to download: a release per
+# `v*` tag, and a rolling `main-latest` prerelease for each push to main.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fusefs-release-${{ github.ref }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: |
+          nix build --print-build-logs .#static
+          cp result/bin/gha-cache-fusefs gha-cache-fusefs-${{ matrix.arch }}-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gha-cache-fusefs-${{ matrix.arch }}
+          path: gha-cache-fusefs-${{ matrix.arch }}-linux
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gha-cache-fusefs-*
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum gha-cache-fusefs-*-linux > SHA256SUMS
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag \
+              --title "gha-cache-fusefs $GITHUB_REF_NAME" --generate-notes \
+              gha-cache-fusefs-*-linux SHA256SUMS
+          else
+            tag="$GITHUB_REF_NAME-latest"
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+              --title "gha-cache-fusefs ($GITHUB_REF_NAME, ${GITHUB_SHA::7})" \
+              --notes "Static builds of $GITHUB_SHA, replaced on every push to $GITHUB_REF_NAME." \
+              gha-cache-fusefs-*-linux SHA256SUMS
+          fi
