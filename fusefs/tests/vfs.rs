@@ -1,12 +1,16 @@
 //! The filesystem core against the fake cache service: every test plays
 //! several "jobs" that mount the same cache one after another.
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gha_cache_fusefs::api::Api;
 use gha_cache_fusefs::data::DataStore;
-use gha_cache_fusefs::entry::{KeySpace, Kind, Meta};
+use gha_cache_fusefs::entry::Volume;
+use gha_cache_fusefs::erofs;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer, RateLimit};
+use gha_cache_fusefs::index;
 use gha_cache_fusefs::vfs::{
     Attr, Errno, FileKind, Ino, ROOT, RenameMode, SetAttr, SetTime, Vfs, VfsConfig,
 };
@@ -31,7 +35,7 @@ async fn job_with(server: &FakeServer, git_ref: &str, tweak: impl FnOnce(&mut Vf
     let api = Api::new(&env).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = DataStore::new(&dir.path().join("data"), 1 << 30, 8).unwrap();
-    let mut cfg = VfsConfig::new(KeySpace::new("fusefs/"));
+    let mut cfg = VfsConfig::new(Volume::new("default").unwrap());
     cfg.settle = Duration::from_millis(20);
     cfg.refresh = None;
     tweak(&mut cfg);
@@ -41,6 +45,11 @@ async fn job_with(server: &FakeServer, git_ref: &str, tweak: impl FnOnce(&mut Vf
 
 async fn job(server: &FakeServer, git_ref: &str) -> Job {
     job_with(server, git_ref, |_| {}).await
+}
+
+/// A job that commits only when it unmounts, so in one layer.
+async fn patient_job(server: &FakeServer, git_ref: &str) -> Job {
+    job_with(server, git_ref, |c| c.settle = Duration::from_secs(3600)).await
 }
 
 async fn server() -> FakeServer {
@@ -128,16 +137,31 @@ async fn drained(vfs: &Vfs) {
     );
 }
 
-fn keys(server: &FakeServer) -> Vec<String> {
-    let mut k: Vec<String> = server.entries().into_iter().map(|(k, _, _)| k).collect();
+/// The keys of the default volume's layers or blobs, with their sizes.
+fn entries(server: &FakeServer, kind: &str) -> Vec<(String, u64)> {
+    let prefix = format!("gha-fs/default/{kind}/");
+    let mut k: Vec<(String, u64)> = server
+        .entries()
+        .into_iter()
+        .filter(|(k, _, _)| k.starts_with(&prefix))
+        .map(|(k, _, size)| (k, size))
+        .collect();
     k.sort();
     k
+}
+
+fn layers(server: &FakeServer) -> usize {
+    entries(server, "layer").len()
+}
+
+fn blobs(server: &FakeServer) -> usize {
+    entries(server, "blob").len()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn files_persist_across_jobs() {
     let server = server().await;
-    let a = job(&server, MAIN).await;
+    let a = patient_job(&server, MAIN).await;
     write_file(&a, ROOT, "hello.txt", b"hello, world\n");
     let d = a.mkdir(ROOT, "d", 0o755).unwrap();
     let big = noise(3 << 20, 1);
@@ -145,7 +169,7 @@ async fn files_persist_across_jobs() {
     // Visible and readable in the writing job before anything is uploaded.
     assert_eq!(cat(&a, "hello.txt").await, b"hello, world\n");
     drained(&a).await;
-    assert_eq!(keys(&server), ["fusefs/d/x.bin", "fusefs/hello.txt"]);
+    assert_eq!((layers(&server), blobs(&server)), (1, 0));
 
     let b = job(&server, MAIN).await;
     assert_eq!(ls(&b, ROOT), ["d", "hello.txt"]);
@@ -285,8 +309,9 @@ async fn write_then_rename_uploads_only_the_final_name() {
         .await
         .unwrap();
     assert_eq!(cat(&a, "out").await, b"payload");
-    drained(&a).await;
-    assert_eq!(keys(&server), ["fusefs/out"]);
+    let summary = a.drain().await;
+    assert_eq!((summary.uploaded_files, summary.whiteouts), (1, 0));
+    assert_eq!(layers(&server), 1);
     let b = job(&server, MAIN).await;
     assert_eq!(cat(&b, "out").await, b"payload");
 }
@@ -295,19 +320,27 @@ async fn write_then_rename_uploads_only_the_final_name() {
 async fn renaming_committed_and_remote_files() {
     let server = server().await;
     let a = job(&server, MAIN).await;
-    write_file(&a, ROOT, "f", b"content");
+    // Too large to be inline in the layer's metadata.
+    let content = noise(5000, 9);
+    write_file(&a, ROOT, "f", &content);
+    write_file(&a, ROOT, "tiny", b"inline");
     drained(&a).await;
 
     // Still cached locally: the rename re-uploads under the new name.
     let b = job(&server, MAIN).await;
-    assert_eq!(cat(&b, "f").await, b"content");
+    assert_eq!(cat(&b, "f").await, content);
     b.rename(ROOT, "f", ROOT, "g", RenameMode::Replace)
+        .await
+        .unwrap();
+    // Small files arrive with the metadata, so they are always at hand.
+    b.rename(ROOT, "tiny", ROOT, "small", RenameMode::Replace)
         .await
         .unwrap();
     drained(&b).await;
     let c = job(&server, MAIN).await;
-    assert_eq!(ls(&c, ROOT), ["g"]);
-    assert_eq!(cat(&c, "g").await, b"content");
+    assert_eq!(ls(&c, ROOT), ["g", "small"]);
+    assert_eq!(cat(&c, "g").await, content);
+    assert_eq!(cat(&c, "small").await, b"inline");
 
     // Not cached: moving it would mean downloading it, so the kernel is told
     // to copy instead (mv does this transparently).
@@ -326,6 +359,21 @@ async fn renaming_committed_and_remote_files() {
             .unwrap_err(),
         Errno(libc::EEXIST)
     );
+
+    // A symlink's target comes with the layer, so renaming one never needs
+    // the network.
+    d.symlink(ROOT, "link", "g").unwrap();
+    drained(&d).await;
+    let e = job(&server, MAIN).await;
+    lookup(&e, "link").await.unwrap();
+    e.rename(ROOT, "link", ROOT, "moved", RenameMode::Replace)
+        .await
+        .unwrap();
+    drained(&e).await;
+    let f = job(&server, MAIN).await;
+    let l = lookup(&f, "moved").await.unwrap();
+    assert_eq!(f.readlink(l.ino).await.unwrap(), "g");
+    assert!(lookup(&f, "link").await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -336,8 +384,8 @@ async fn directories_persist_when_empty_and_vanish_when_removed() {
     let p = a.mkdir(ROOT, "p", 0o755).unwrap();
     let q = a.mkdir(p.ino, "q", 0o755).unwrap();
     write_file(&a, q.ino, "f", b"x");
-    drained(&a).await;
-    assert_eq!(keys(&server), ["fusefs/empty/", "fusefs/p/q/f"]);
+    let summary = a.drain().await;
+    assert_eq!(summary.dir_markers, 3, "one keep per mkdir");
 
     let b = job(&server, MAIN).await;
     assert_eq!(ls(&b, ROOT), ["empty", "p"]);
@@ -357,7 +405,7 @@ async fn directories_persist_when_empty_and_vanish_when_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renaming_a_local_directory() {
     let server = server().await;
-    let a = job(&server, MAIN).await;
+    let a = patient_job(&server, MAIN).await;
     let d = a.mkdir(ROOT, "d", 0o755).unwrap();
     write_file(&a, d.ino, "a", b"A");
     let sub = a.mkdir(d.ino, "sub", 0o755).unwrap();
@@ -366,9 +414,10 @@ async fn renaming_a_local_directory() {
         .await
         .unwrap();
     drained(&a).await;
-    assert_eq!(keys(&server), ["fusefs/e/a", "fusefs/e/sub/b"]);
 
     let b = job(&server, MAIN).await;
+    assert_eq!(ls(&b, ROOT), ["e"]);
+    assert_eq!(ls_path(&b, "e").await, ["a", "sub"]);
     assert_eq!(cat(&b, "e/sub/b").await, b"B");
     // Remote content cannot be moved in place.
     assert_eq!(
@@ -386,7 +435,8 @@ async fn large_files_use_block_uploads_and_ranged_reads() {
     let data = noise(40 << 20, 7);
     write_file(&a, ROOT, "big", &data);
     drained(&a).await;
-    assert_eq!(server.entries()[0].2, data.len() as u64);
+    let blob = &entries(&server, "blob")[0];
+    assert_eq!(blob.1, data.len() as u64);
 
     let b = job(&server, MAIN).await;
     let f = lookup(&b, "big").await.unwrap();
@@ -427,7 +477,7 @@ async fn transient_service_failures_are_retried() {
 async fn rate_limited_creations_wait_and_are_reported() {
     let server = FakeServer::start(FakeConfig {
         create_limit: Some(RateLimit {
-            calls: 5,
+            calls: 1,
             window: Duration::from_secs(2),
         }),
         ..FakeConfig::default()
@@ -435,17 +485,23 @@ async fn rate_limited_creations_wait_and_are_reported() {
     .await
     .unwrap();
     let a = job(&server, MAIN).await;
-    for i in 0..8 {
-        write_file(&a, ROOT, &format!("f{i}"), b"x");
+    // Each fsync commits a layer of its own.
+    for i in 0..2 {
+        let (_, fh) = a
+            .create(ROOT, &format!("f{i}"), 0o644, libc::O_WRONLY)
+            .unwrap();
+        a.write(fh, 0, b"x").unwrap();
+        a.fsync(fh).await.unwrap();
+        a.release(fh).unwrap();
     }
     let summary = a.drain().await;
     assert!(summary.failures.is_empty(), "{:?}", summary.failures);
-    assert_eq!(summary.uploaded_files, 8);
+    assert_eq!((summary.uploaded_files, summary.layers), (2, 2));
     assert!(summary.rate_limited >= 1);
     assert!(summary.rate_limit_pause_ms >= 1000, "{summary:?}");
-    // Create and finalize for each file, plus the refused creations.
-    assert_eq!(summary.requests.cache_service, 16 + summary.rate_limited);
-    assert_eq!(summary.requests.blob, 8);
+    // Create and finalize for each layer, plus the refused creations.
+    assert_eq!(summary.requests.cache_service, 4 + summary.rate_limited);
+    assert_eq!(summary.requests.blob, 2);
     assert_eq!(summary.requests.rest, 1);
 }
 
@@ -461,22 +517,24 @@ async fn a_rate_limit_on_creating_entries_does_not_hold_up_reads() {
     .await
     .unwrap();
     let a = job(&server, MAIN).await;
-    write_file(&a, ROOT, "target", b"read me");
+    // Too large to arrive inline with the layer's metadata.
+    write_file(&a, ROOT, "target", &noise(5000, 1));
     drained(&a).await;
 
     let b = job(&server, MAIN).await;
     let target = lookup(&b, "target").await.unwrap();
-    for i in 0..3 {
-        write_file(&b, ROOT, &format!("f{i}"), b"x");
-    }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while b.summary().rate_limited == 0 {
+    for i in 0.. {
+        if b.summary().rate_limited > 0 {
+            break;
+        }
         assert!(Instant::now() < deadline, "never rate limited");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        write_file(&b, ROOT, &format!("f{i}"), b"x");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // Uploads now wait for the window to close; downloads do not.
     let t = Instant::now();
-    assert_eq!(read_file(&b, target.ino).await, b"read me");
+    assert_eq!(read_file(&b, target.ino).await, noise(5000, 1));
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
 }
 
@@ -499,7 +557,7 @@ async fn an_exhausted_rest_budget_fails_fast() {
     let env = server.env(MAIN, &[]);
     let dir = tempfile::tempdir().unwrap();
     let store = DataStore::new(&dir.path().join("data"), 1 << 30, 8).unwrap();
-    let cfg = VfsConfig::new(KeySpace::new("fusefs/"));
+    let cfg = VfsConfig::new(Volume::new("default").unwrap());
     let loaded = Vfs::load(cfg, Api::new(&env).unwrap(), store, env.scopes()).await;
     let err = format!("{:#}", loaded.err().expect("the listing is refused"));
     assert!(err.contains("rate limited; try again in"), "{err}");
@@ -532,24 +590,30 @@ async fn entries_deleted_during_a_listing_do_not_hide_others() {
     })
     .await
     .unwrap();
+    let volume = Volume::new("default").unwrap();
+    let mut keys = Vec::new();
     for i in 0..300 {
-        let version = Meta::new(Kind::File, 0o644, SystemTime::now()).encode();
-        let data = bytes::Bytes::from_static(b"x");
-        server.insert(&format!("fusefs/f{i:03}"), &version, MAIN, data);
+        let (image, version) = index::layer_image(&[(format!("f{i:03}"), b"x".to_vec())]).unwrap();
+        let key = volume.layer_key(version.nonce);
+        server.insert(&key, &version.encode(), MAIN, bytes::Bytes::from(image));
+        keys.push(key);
     }
     let env = server.env(MAIN, &[]);
     let api = Api::new(&env).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = DataStore::new(&dir.path().join("data"), 1 << 30, 8).unwrap();
-    let mut cfg = VfsConfig::new(KeySpace::new("fusefs/"));
+    let mut cfg = VfsConfig::new(volume);
     cfg.refresh = None;
     // The first of three pages arrives after 0.5 s, the others after 1 s;
-    // in between, the ten oldest entries are evicted.
+    // in between, the ten oldest layers are evicted. Once the pages are in,
+    // the service speeds up, so that reading 290 layers takes no time.
     let evict = async {
         tokio::time::sleep(Duration::from_millis(750)).await;
-        for i in 0..10 {
-            server.remove(&format!("fusefs/f{i:03}"), MAIN);
+        for key in &keys[..10] {
+            server.remove(key, MAIN);
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        server.set_config(|c| c.latency = Duration::ZERO);
     };
     let (vfs, ()) = tokio::join!(Vfs::load(cfg, api, store, env.scopes()), evict);
     let names = ls(&vfs.unwrap(), ROOT);
@@ -559,43 +623,29 @@ async fn entries_deleted_during_a_listing_do_not_hide_others() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn entries_nothing_reads_are_kept_alive() {
+async fn blobs_nothing_reads_are_kept_alive() {
     let server = server().await;
     let main = job(&server, MAIN).await;
-    write_file(&main, ROOT, "shared", b"from main");
-    write_file(&main, ROOT, "gone", b"from main");
+    write_file(&main, ROOT, "big", &noise(10 << 20, 1));
+    write_file(&main, ROOT, "small", b"in the layer");
     drained(&main).await;
-    let feature = job(&server, FEATURE).await;
-    feature.unlink(ROOT, "shared").unwrap();
-    feature.unlink(ROOT, "gone").unwrap();
-    feature.mkdir(ROOT, "empty", 0o755).unwrap();
-    write_file(&feature, ROOT, "stamp", b"");
-    write_file(&feature, ROOT, "data", b"read when needed");
-    drained(&feature).await;
-    // Main's "gone" is evicted, so its whiteout hides nothing. Then four
-    // days pass, as far as the service can tell.
-    server.remove("fusefs/gone", MAIN);
+    // Four days pass, as far as the service can tell.
     server.age(Duration::from_secs(4 * 24 * 3600));
     let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
 
     let again = job(&server, FEATURE).await;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while again.summary().touched < 3 {
+    while again.summary().touched < 1 {
         assert!(Instant::now() < deadline, "{:?}", again.summary());
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    for key in ["fusefs/shared", "fusefs/empty/", "fusefs/stamp"] {
-        assert!(server.last_used(key, FEATURE).unwrap() > stale, "{key}");
+    // Mounting read every layer, and touched the blob nothing read.
+    let all = [entries(&server, "layer"), entries(&server, "blob")].concat();
+    assert_eq!(all.len(), 2);
+    for (key, _) in &all {
+        assert!(server.last_used(key, MAIN).unwrap() > stale, "{key}");
     }
-    // Reads keep regular files alive, and nothing needs the rest.
-    for (key, scope) in [
-        ("fusefs/data", FEATURE),
-        ("fusefs/gone", FEATURE),
-        ("fusefs/shared", MAIN),
-    ] {
-        assert!(server.last_used(key, scope).unwrap() < stale, "{key}");
-    }
-    assert_eq!(again.summary().touched, 3);
+    assert_eq!(again.summary().touched, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -605,7 +655,7 @@ async fn fsync_commits_before_close() {
     let (_, fh) = a.create(ROOT, "log", 0o644, libc::O_WRONLY).unwrap();
     a.write(fh, 0, b"first").unwrap();
     a.fsync(fh).await.unwrap();
-    assert_eq!(keys(&server), ["fusefs/log"]);
+    assert_eq!(layers(&server), 1);
     let b = job(&server, MAIN).await;
     assert_eq!(cat(&b, "log").await, b"first");
     a.write(fh, 5, b" second").unwrap();
@@ -720,6 +770,9 @@ async fn many_small_files() {
     let summary = a.drain().await;
     assert!(summary.failures.is_empty());
     assert_eq!(summary.uploaded_files, 300);
+    // A few layers, each a creation and a finalization.
+    assert!(summary.layers < 10, "{summary:?}");
+    assert_eq!(summary.requests.cache_service, 2 * summary.layers);
     let b = job(&server, MAIN).await;
     assert_eq!(ls_path(&b, "many").await.len(), 300);
     assert_eq!(cat(&b, "many/123").await, noise(1123, 123));
@@ -732,15 +785,13 @@ async fn entries_from_other_tools_are_ignored() {
     let env = server.env(MAIN, &[]);
     let api = Api::new(&env).unwrap();
     let version = "a".repeat(64);
-    let url = api.twirp.create("fusefs/foreign", &version).await.unwrap();
+    let key = Volume::new("default").unwrap().layer_key(1);
+    let url = api.twirp.create(&key, &version).await.unwrap();
     api.blob
         .put_blob(&url, bytes::Bytes::from_static(b"tar"))
         .await
         .unwrap();
-    api.twirp
-        .finalize("fusefs/foreign", &version, 3)
-        .await
-        .unwrap();
+    api.twirp.finalize(&key, &version, 3).await.unwrap();
     let a = job(&server, MAIN).await;
     assert!(ls(&a, ROOT).is_empty());
 }
@@ -784,31 +835,388 @@ async fn reading_one_small_file_prefetches_its_siblings() {
     drained(&a).await;
 
     let b = job(&server, MAIN).await;
+    let before = server.blob_requests();
     assert_eq!(cat(&b, "src/f00").await, noise(3000, 0));
-    // Wait for the background fetches to settle.
+    // The small files are one range of the layer, fetched at once.
     let mut last = server.blob_requests();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let now = server.blob_requests();
-        if now == last && now > 1 {
+        if now == last {
             break;
         }
         last = now;
     }
-    let before = server.blob_requests();
-    assert!(
-        before >= 20,
-        "siblings were not prefetched: {before} blob requests"
-    );
     for i in 1..20u64 {
         assert_eq!(cat(&b, &format!("src/f{i:02}")).await, noise(3000, i));
     }
-    assert_eq!(
-        server.blob_requests(),
-        before,
-        "a prefetched file was fetched again"
-    );
+    let gets = server.blob_requests() - before;
+    assert!(gets <= 3, "{gets} requests for 20 small files");
     // Large files are left alone until they are read.
+    let before = server.blob_requests();
     assert_eq!(cat(&b, "src/big").await, noise(3 << 20, 99));
     assert!(server.blob_requests() > before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thousand_files_are_one_creation() {
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let top = a.mkdir(ROOT, "tree", 0o755).unwrap();
+    let mut dirs = Vec::new();
+    for d in 0..10 {
+        dirs.push(a.mkdir(top.ino, &format!("d{d}"), 0o755).unwrap().ino);
+    }
+    for i in 0..1000u64 {
+        write_file(
+            &a,
+            dirs[i as usize % 10],
+            &format!("f{i:04}"),
+            &noise(4096, i),
+        );
+    }
+    let summary = a.drain().await;
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!((summary.layers, summary.blobs), (1, 0));
+    assert_eq!(summary.requests.cache_service, 2);
+    assert_eq!((summary.uploaded_files, summary.dir_markers), (1000, 11));
+
+    // Removing them all is one creation too.
+    let b = patient_job(&server, MAIN).await;
+    assert_eq!(cat(&b, "tree/d7/f0587").await, noise(4096, 587));
+    for d in 0..10 {
+        let dir = lookup(&b, &format!("tree/d{d}")).await.unwrap().ino;
+        for name in ls(&b, dir) {
+            b.unlink(dir, &name).unwrap();
+        }
+        b.rmdir(top_ino(&b).await, &format!("d{d}")).unwrap();
+    }
+    b.rmdir(ROOT, "tree").unwrap();
+    let summary = b.drain().await;
+    assert_eq!(
+        (summary.layers, summary.whiteouts, summary.dir_markers),
+        (1, 1000, 11)
+    );
+    let c = job(&server, MAIN).await;
+    assert!(ls(&c, ROOT).is_empty());
+}
+
+async fn top_ino(vfs: &Vfs) -> Ino {
+    lookup(vfs, "tree").await.unwrap().ino
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_hides_only_what_the_deleting_job_saw() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o755).unwrap();
+    write_file(&a, d.ino, "old", b"seen by both");
+    drained(&a).await;
+
+    // Two jobs start from the same cache. One adds a file to d; the other,
+    // which never sees it, removes d with everything it knows of.
+    let adder = job(&server, MAIN).await;
+    let remover = job(&server, MAIN).await;
+    let d = lookup(&adder, "d").await.unwrap();
+    write_file(&adder, d.ino, "new", b"added concurrently");
+    drained(&adder).await;
+    let d = lookup(&remover, "d").await.unwrap();
+    remover.unlink(d.ino, "old").unwrap();
+    remover.rmdir(ROOT, "d").unwrap();
+    drained(&remover).await;
+
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls_path(&c, "d").await, ["new"]);
+    assert_eq!(cat(&c, "d/new").await, b"added concurrently");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_attributes_persist() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o755).unwrap();
+    write_file(&a, d.ino, "f", b"x");
+    drained(&a).await;
+
+    let b = job(&server, MAIN).await;
+    let d = lookup(&b, "d").await.unwrap();
+    let mtime = UNIX_EPOCH + Duration::new(1_600_000_000, 5);
+    b.setattr(
+        d.ino,
+        None,
+        SetAttr {
+            mode: Some(0o700),
+            mtime: Some(SetTime::At(mtime)),
+            ..SetAttr::default()
+        },
+    )
+    .await
+    .unwrap();
+    drained(&b).await;
+
+    let c = job(&server, MAIN).await;
+    let d = lookup(&c, "d").await.unwrap();
+    assert_eq!((d.perm, d.mtime), (0o700, mtime));
+    // A later layer that only passes through keeps them.
+    write_file(&c, d.ino, "g", b"y");
+    drained(&c).await;
+    let e = job(&server, MAIN).await;
+    assert_eq!(lookup(&e, "d").await.unwrap().perm, 0o700);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volumes_are_separate() {
+    let server = server().await;
+    let in_volume =
+        |name: &'static str| move |c: &mut VfsConfig| c.volume = Volume::new(name).unwrap();
+    let a = job_with(&server, MAIN, in_volume("one")).await;
+    write_file(&a, ROOT, "f", b"in one");
+    drained(&a).await;
+    let b = job_with(&server, MAIN, in_volume("two")).await;
+    assert!(ls(&b, ROOT).is_empty());
+    write_file(&b, ROOT, "f", b"in two");
+    drained(&b).await;
+    let c = job_with(&server, MAIN, in_volume("one")).await;
+    assert_eq!(cat(&c, "f").await, b"in one");
+    assert!(
+        server
+            .entries()
+            .iter()
+            .all(|(k, _, _)| k.starts_with("gha-fs/one/") || k.starts_with("gha-fs/two/"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mounting_a_directory_of_the_volume() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let sub = a.mkdir(ROOT, "sub", 0o755).unwrap();
+    let dir = a.mkdir(sub.ino, "dir", 0o755).unwrap();
+    write_file(&a, dir.ino, "f", b"deep");
+    write_file(&a, ROOT, "outside", b"not shown");
+    drained(&a).await;
+
+    let at_sub = |c: &mut VfsConfig| *c = c.clone().with_root("sub").unwrap();
+    let b = job_with(&server, MAIN, at_sub).await;
+    assert_eq!(ls(&b, ROOT), ["dir"]);
+    assert_eq!(cat(&b, "dir/f").await, b"deep");
+    write_file(&b, ROOT, "g", b"written below sub");
+    b.unlink(lookup(&b, "dir").await.unwrap().ino, "f").unwrap();
+    drained(&b).await;
+
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls(&c, ROOT), ["outside", "sub"]);
+    assert_eq!(ls_path(&c, "sub").await, ["dir", "g"]);
+    assert_eq!(cat(&c, "sub/g").await, b"written below sub");
+    assert!(ls_path(&c, "sub/dir").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_large_files_share_a_blob() {
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let data = noise(10 << 20, 3);
+    write_file(&a, ROOT, "one", &data);
+    write_file(&a, ROOT, "two", &data);
+    let summary = a.drain().await;
+    assert_eq!((summary.layers, summary.blobs), (1, 1));
+    // A later job writing the same content uploads nothing but a layer.
+    let b = job(&server, FEATURE).await;
+    write_file(&b, ROOT, "three", &data);
+    let summary = b.drain().await;
+    assert_eq!((summary.layers, summary.blobs), (1, 0));
+    let c = job(&server, FEATURE).await;
+    for name in ["one", "two", "three"] {
+        assert_eq!(cat(&c, name).await, data, "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_whose_blob_is_gone_is_gone() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "big", &noise(10 << 20, 4));
+    write_file(&a, ROOT, "small", b"still here");
+    drained(&a).await;
+    let (blob, _) = entries(&server, "blob").remove(0);
+    server.remove(&blob, MAIN);
+    let b = job(&server, MAIN).await;
+    assert_eq!(ls(&b, ROOT), ["small"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_made_while_sealing_wait_for_the_next_layer() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    // A file that keeps changing is committed as it was, and then as it is.
+    let (_, fh) = a.create(ROOT, "log", 0o644, libc::O_WRONLY).unwrap();
+    for i in 0..50u64 {
+        a.write(fh, i * 4096, &noise(4096, i)).unwrap();
+        if i % 10 == 0 {
+            let _ = a.fsync(fh).await;
+        }
+    }
+    a.release(fh).unwrap();
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    let want: Vec<u8> = (0..50u64).flat_map(|i| noise(4096, i)).collect();
+    assert_eq!(cat(&b, "log").await, want);
+}
+
+fn tool(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Every layer the filesystem writes is an EROFS image that erofs-utils
+/// accepts, blobs and all. Skipped without `fsck.erofs` on PATH.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn layers_pass_fsck() {
+    let Some(fsck) = tool("fsck.erofs") else {
+        eprintln!("skipping: fsck.erofs is not on PATH");
+        return;
+    };
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o700).unwrap();
+    write_file(&a, d.ino, "inline", b"small");
+    write_file(&a, d.ino, "blocks", &noise(100_000, 1));
+    write_file(&a, d.ino, "blob", &noise(9 << 20, 2));
+    write_file(&a, ROOT, "doomed", b"x");
+    a.symlink(d.ino, "link", "inline").unwrap();
+    drained(&a).await;
+    let b = patient_job(&server, MAIN).await;
+    b.unlink(ROOT, "doomed").unwrap();
+    let d = lookup(&b, "d").await.unwrap();
+    b.setattr(
+        d.ino,
+        None,
+        SetAttr {
+            mode: Some(0o755),
+            ..SetAttr::default()
+        },
+    )
+    .await
+    .unwrap();
+    drained(&b).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("blob");
+    let (blob, _) = entries(&server, "blob").remove(0);
+    std::fs::write(&blob_path, server.data(&blob, MAIN).unwrap()).unwrap();
+    let layers = entries(&server, "layer");
+    assert_eq!(layers.len(), 2);
+    for (i, (key, _)) in layers.iter().enumerate() {
+        let image = server.data(key, MAIN).unwrap();
+        let listing = erofs::read(&image).unwrap();
+        let path = dir.path().join(format!("layer{i}"));
+        std::fs::write(&path, &image).unwrap();
+        let mut cmd = Command::new(&fsck);
+        for (tag, _) in &listing.devices {
+            assert_eq!(blob.rsplit('/').next(), Some(tag.as_str()));
+            cmd.arg(format!("--device={}", blob_path.display()));
+        }
+        let out = cmd.arg(&path).output().unwrap();
+        assert!(
+            out.status.success(),
+            "fsck.erofs rejected {key}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_a_directory_takes_everything_pending_in_it() {
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "pkg", 0o755).unwrap();
+    write_file(&a, d.ino, "a", b"inside");
+    // Sorts between "pkg" and "pkg/".
+    write_file(&a, ROOT, "pkg.tar", b"beside");
+    a.rename(ROOT, "pkg", ROOT, "moved", RenameMode::Replace)
+        .await
+        .unwrap();
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    assert_eq!(ls(&b, ROOT), ["moved", "pkg.tar"]);
+    assert_eq!(cat(&b, "moved/a").await, b"inside");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_renamed_twice_keeps_its_old_name_until_the_new_one_lands() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "x", &noise(5000, 1));
+    drained(&a).await;
+
+    let b = job(&server, MAIN).await;
+    let x = lookup(&b, "x").await.unwrap();
+    let (fh, _) = b.open(x.ino, libc::O_RDWR).await.unwrap();
+    b.write(fh, 0, b"changed").unwrap();
+    b.rename(ROOT, "x", ROOT, "y", RenameMode::Replace)
+        .await
+        .unwrap();
+    b.rename(ROOT, "y", ROOT, "z", RenameMode::Replace)
+        .await
+        .unwrap();
+    // z is still open, so it is not committed; neither may x's removal be.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls(&c, ROOT), ["x"]);
+    b.release(fh).unwrap();
+    drained(&b).await;
+    let d = job(&server, MAIN).await;
+    assert_eq!(ls(&d, ROOT), ["z"]);
+    assert_eq!(&cat(&d, "z").await[..7], b"changed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chmod_while_a_mark_uploads_is_not_lost() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o755).unwrap();
+    write_file(&a, d.ino, "f", b"x");
+    drained(&a).await;
+
+    server.set_config(|c| c.latency = Duration::from_millis(300));
+    let b = job(&server, MAIN).await;
+    let d = lookup(&b, "d").await.unwrap();
+    let chmod = |mode| SetAttr {
+        mode: Some(mode),
+        ..SetAttr::default()
+    };
+    b.setattr(d.ino, None, chmod(0o700)).await.unwrap();
+    // The first mark is on its way up when the second chmod lands.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    b.setattr(d.ino, None, chmod(0o711)).await.unwrap();
+    drained(&b).await;
+    assert_eq!(b.getattr(d.ino).unwrap().perm, 0o711);
+    server.set_config(|c| c.latency = Duration::ZERO);
+    let c = job(&server, MAIN).await;
+    assert_eq!(lookup(&c, "d").await.unwrap().perm, 0o711);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_replacement_keeps_the_original_removed() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "was-file", b"x");
+    a.mkdir(ROOT, "was-dir", 0o755).unwrap();
+    drained(&a).await;
+
+    let b = job(&server, MAIN).await;
+    lookup(&b, "was-file").await.unwrap();
+    b.unlink(ROOT, "was-file").unwrap();
+    b.mkdir(ROOT, "was-file", 0o755).unwrap();
+    b.rmdir(ROOT, "was-file").unwrap();
+    lookup(&b, "was-dir").await.unwrap();
+    b.rmdir(ROOT, "was-dir").unwrap();
+    write_file(&b, ROOT, "was-dir", b"y");
+    b.unlink(ROOT, "was-dir").unwrap();
+    drained(&b).await;
+    let c = job(&server, MAIN).await;
+    assert!(ls(&c, ROOT).is_empty(), "{:?}", ls(&c, ROOT));
 }

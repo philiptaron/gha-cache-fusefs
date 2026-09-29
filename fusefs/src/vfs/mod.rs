@@ -1,9 +1,11 @@
 //! The filesystem core, independent of FUSE.
 //!
-//! The namespace is a tree of inodes built from the remote view (the merged
-//! listing) plus a local overlay of operations that have not been committed
-//! to the cache yet. One operation is pending per key; it is a `Put` of the
-//! node currently at that path, or a `Delete` (a whiteout). See DESIGN.md.
+//! The namespace is a tree of inodes built from the remote view (the layers,
+//! stacked) plus a local overlay of operations that have not been committed
+//! to the cache yet. One operation is pending per path: a `Put` of the node
+//! currently there, or a `Remove` of what the view shows there. The
+//! committer turns each batch of them into a layer. See DESIGN.md and
+//! LAYERS.md.
 
 mod commit;
 mod state;
@@ -18,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 
 use crate::api::{Api, Requests};
-use crate::data::{CHUNK, DataFile, DataStore, RUN, RemoteData};
-use crate::entry::{KeySpace, MAX_KEY_LEN, join, valid_component};
-use crate::index::{self, Index};
+use crate::data::{CHUNK, DataFile, DataStore, RUN, RemoteData, RemoteFile};
+use crate::entry::{self, Mark, Version, Volume, join, valid_component};
+use crate::index::{self, Index, Item};
 
 use state::{Body, Content, Dir, File, Handle, PendingOp, State, Symlink};
 
@@ -120,7 +122,9 @@ pub enum RenameMode {
 
 #[derive(Clone, Debug)]
 pub struct VfsConfig {
-    pub keys: KeySpace,
+    pub volume: Volume,
+    /// The directory of the volume the mount shows ("" for all of it).
+    root: String,
     pub read_only: bool,
     /// How long a closed file waits before it is uploaded.
     pub settle: Duration,
@@ -129,8 +133,6 @@ pub struct VfsConfig {
     pub uid: u32,
     pub gid: u32,
     pub upload_concurrency: usize,
-    /// Delete superseded entries of the run's own scope (needs `actions: write`).
-    pub gc: bool,
     /// Reported as the filesystem size.
     pub quota: u64,
     /// Attempts per operation once unmounting has started.
@@ -138,24 +140,55 @@ pub struct VfsConfig {
 }
 
 impl VfsConfig {
-    pub fn new(keys: KeySpace) -> VfsConfig {
+    pub fn new(volume: Volume) -> VfsConfig {
         VfsConfig {
-            keys,
+            volume,
+            root: String::new(),
             read_only: false,
             settle: Duration::from_secs(1),
             refresh: Some(Duration::from_secs(15)),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
             upload_concurrency: 8,
-            gc: false,
             quota: 10 << 30,
             drain_attempts: 5,
+        }
+    }
+
+    /// Shows only the directory `root` of the volume, such as `a/b`.
+    pub fn with_root(mut self, root: &str) -> std::result::Result<VfsConfig, String> {
+        let root = root.trim_matches('/');
+        if !root.is_empty() && !root.split('/').all(valid_component) {
+            return Err(format!("{root:?} is not a path in the volume"));
+        }
+        self.root = root.to_string();
+        Ok(self)
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The path in the volume of a path below the mount root.
+    pub fn full(&self, path: &str) -> String {
+        join(&self.root, path)
+    }
+
+    /// The path below the mount root of a path in the volume, if it is there.
+    pub fn local<'a>(&self, full: &'a str) -> Option<&'a str> {
+        if self.root.is_empty() {
+            Some(full)
+        } else if full == self.root {
+            Some("")
+        } else {
+            full.strip_prefix(&self.root)?.strip_prefix('/')
         }
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Failure {
+    /// The path below the mount root. (Format 1 named failures by key.)
     pub key: String,
     pub error: String,
 }
@@ -164,14 +197,18 @@ pub struct Failure {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Summary {
+    /// Files and symlinks committed, and the bytes of the files.
     pub uploaded_files: u64,
     pub uploaded_bytes: u64,
     pub whiteouts: u64,
+    /// Directory marks: `keep`, `attrs`, and `drop`.
     pub dir_markers: u64,
+    /// Cache entries created: one layer per batch, one blob per large file.
+    pub layers: u64,
+    pub blobs: u64,
     pub download_requests: u64,
     pub downloaded_bytes: u64,
-    pub gc_deleted: u64,
-    /// Entries kept from expiring because nothing else would use them (see
+    /// Blobs kept from expiring because nothing read them (see
     /// `Vfs::touch_stale`).
     pub touched: u64,
     pub requests: Requests,
@@ -188,7 +225,8 @@ struct Stats {
     uploaded_bytes: AtomicU64,
     whiteouts: AtomicU64,
     dir_markers: AtomicU64,
-    gc_deleted: AtomicU64,
+    layers: AtomicU64,
+    blobs: AtomicU64,
     touched: AtomicU64,
 }
 
@@ -220,22 +258,21 @@ impl Vfs {
         store: Arc<DataStore>,
         scopes: Vec<String>,
     ) -> anyhow::Result<Vfs> {
-        let mut index = Index::new(scopes);
-        let items = index::list_all(&api.rest, cfg.keys.prefix(), index.scopes()).await?;
-        let (mut ours, mut foreign) = (0usize, 0usize);
-        for item in &items {
-            match index.entry_from_item(item) {
-                Some(e) => {
-                    ours += 1;
-                    index.insert(e);
-                }
-                None => foreign += 1,
-            }
+        let mut index = Index::new(cfg.volume.clone(), scopes);
+        let prefix = cfg.volume.prefix();
+        let items = index::list_all(&api.rest, prefix, index.scopes()).await?;
+        let (layers, blobs, foreign) = sort_items(&index, &items);
+        let (n_layers, n_blobs) = (layers.len(), blobs.len());
+        for (entry, sha) in blobs {
+            index.insert_blob(entry, sha);
         }
+        for layer in index::read_layers(&api, layers).await? {
+            index.insert_layer(layer);
+        }
+        index.restack();
         tracing::info!(
-            "listed {} entries under {:?} in {:?} ({ours} ours, {foreign} ignored)",
+            "listed {} entries under {prefix:?} in {:?} ({n_layers} layers, {n_blobs} blobs, {foreign} ignored)",
             items.len(),
-            cfg.keys.prefix(),
             index.scopes()
         );
         let vfs = Vfs::with_index(cfg, api, store, index);
@@ -243,24 +280,23 @@ impl Vfs {
         Ok(vfs)
     }
 
-    /// The service expires entries a week after their last download, and
-    /// nothing ever downloads a whiteout, a directory marker, or an empty
-    /// file. Left alone, deletions would come back and empty files and
-    /// directories would vanish from trees in daily use. So a mount resolves
-    /// a download URL, which counts as use, for those it depends on that have
-    /// not been used for a while.
+    /// The service expires entries a week after their last download. A
+    /// mount reads the metadata of every layer, which keeps layers alive,
+    /// but a blob is only downloaded when its file is read. So a mount
+    /// resolves a download URL, which counts as use, for the blobs of visible
+    /// files that have not been used for a while (LAYERS.md §7).
     fn touch_stale(&self) {
         let stale = {
             let st = self.0.st.lock();
             let cutoff = SystemTime::now()
                 .checked_sub(TOUCH_AFTER)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            st.index.unused_dependencies(cutoff, TOUCH_MAX)
+            st.index.stale_blobs(cutoff, TOUCH_MAX)
         };
         if stale.is_empty() {
             return;
         }
-        tracing::debug!("touching {} entries nothing reads", stale.len());
+        tracing::debug!("touching {} blobs nothing read", stale.len());
         let vfs = self.clone();
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -283,8 +319,14 @@ impl Vfs {
 
     pub fn with_index(cfg: VfsConfig, api: Api, store: Arc<DataStore>, index: Index) -> Vfs {
         let mut st = State::new(index);
-        for key in st.index.keys() {
-            st.apply_remote(&cfg, &store, &key);
+        let paths: Vec<String> = st
+            .index
+            .paths()
+            .filter_map(|p| cfg.local(p))
+            .map(str::to_string)
+            .collect();
+        for path in paths {
+            st.apply_remote(&cfg, &store, &path);
         }
         let vfs = Vfs(Arc::new(Inner {
             cfg,
@@ -314,20 +356,14 @@ impl Vfs {
         }
     }
 
-    fn check_name(&self, st: &State, parent: Ino, name: &str, dir: bool) -> Result<String> {
+    fn check_name(&self, st: &State, parent: Ino, name: &str) -> Result<String> {
+        if name.len() > entry::NAME_MAX {
+            return Err(ENAMETOOLONG);
+        }
         if !valid_component(name) {
             return Err(EINVAL);
         }
-        let path = join(&st.path(parent), name);
-        let key = if dir {
-            self.0.cfg.keys.dir_key(&path)
-        } else {
-            self.0.cfg.keys.node_key(&path)
-        };
-        if key.len() > MAX_KEY_LEN {
-            return Err(ENAMETOOLONG);
-        }
-        Ok(path)
+        Ok(join(&st.path(parent), name))
     }
 
     fn due(&self) -> Option<Instant> {
@@ -398,32 +434,46 @@ impl Vfs {
             let st = self.0.st.lock();
             (st.index.scopes().to_vec(), st.index.watermarks())
         };
-        let prefix = self.0.cfg.keys.prefix().to_string();
+        let prefix = self.0.cfg.volume.prefix();
         let lists = futures_util::future::try_join_all(
             scopes
                 .iter()
                 .zip(marks)
-                .map(|(scope, mark)| index::list_since(&self.0.api.rest, &prefix, scope, mark)),
+                .map(|(scope, mark)| index::list_since(&self.0.api.rest, prefix, scope, mark)),
         )
+        .await;
+        let result = async {
+            let items: Vec<_> = lists?.into_iter().flatten().collect();
+            let (layers, blobs, _) = sort_items(&self.0.st.lock().index, &items);
+            let layers = index::read_layers(&self.0.api, layers).await?;
+            anyhow::Ok((layers, blobs))
+        }
         .await;
         let mut st = self.0.st.lock();
         st.last_refresh = Instant::now();
-        let mut changed = Vec::new();
-        for item in lists?.iter().flatten() {
-            if let Some(e) = st.index.entry_from_item(item) {
-                let key = e.key.clone();
-                if st.index.insert(e) {
-                    changed.push(key);
-                }
+        let (layers, blobs) = result?;
+        if layers.is_empty() && blobs.is_empty() {
+            return Ok(());
+        }
+        for (entry, sha) in blobs {
+            st.index.insert_blob(entry, sha);
+        }
+        for layer in layers {
+            st.index.insert_layer(layer);
+        }
+        let changed = st.index.restack();
+        tracing::debug!("refresh: {} paths changed", changed.len());
+        self.apply_changes(&mut st, &changed);
+        Ok(())
+    }
+
+    /// Makes the tree agree with the view at paths of the volume that changed.
+    fn apply_changes(&self, st: &mut State, changed: &[String]) {
+        for full in changed {
+            if let Some(path) = self.0.cfg.local(full) {
+                st.apply_remote(&self.0.cfg, &self.0.store, path);
             }
         }
-        if !changed.is_empty() {
-            tracing::debug!("refresh: {} keys changed", changed.len());
-        }
-        for key in changed {
-            st.apply_remote(&self.0.cfg, &self.0.store, &key);
-        }
-        Ok(())
     }
 
     pub fn getattr(&self, ino: Ino) -> Result<Attr> {
@@ -463,32 +513,30 @@ impl Vfs {
         self.check_writable()?;
         let mut st = self.0.st.lock();
         st.dir(parent)?;
-        let path = self.check_name(&st, parent, name, true)?;
+        let path = self.check_name(&st, parent, name)?;
         if st.child(parent, name).is_some() {
             return Err(EEXIST);
         }
-        let key = self.0.cfg.keys.dir_key(&path);
-        let marker = st.index.visible(&key).cloned();
-        if st
-            .overlay
-            .get(&key)
-            .is_some_and(|p| matches!(p.op, PendingOp::Delete { .. }))
-        {
-            // An `rmdir` that has not been committed yet is undone.
-            st.clear_op(&key);
-        }
+        let kept = st.index.kept(&self.0.cfg.full(&path));
         let ino = st.alloc(
             parent,
             name,
             Body::Dir(Dir {
                 children: BTreeMap::new(),
-                marker,
+                kept,
                 pinned: true,
+                mark: Some(Mark::Keep),
+                generation: 0,
                 mode: (mode & 0o7777) as u16,
                 mtime: SystemTime::now(),
             }),
         );
-        Ok(st.attr(&self.0.cfg, ino))
+        // This replaces whatever was pending here, such as an `rmdir`.
+        st.set_op(&path, PendingOp::Put(ino), self.due());
+        let attr = st.attr(&self.0.cfg, ino);
+        drop(st);
+        self.0.wake.notify_one();
+        Ok(attr)
     }
 
     pub fn rmdir(&self, parent: Ino, name: &str) -> Result<()> {
@@ -500,10 +548,10 @@ impl Vfs {
         if !dir.children.is_empty() {
             return Err(ENOTEMPTY);
         }
-        let key = self.0.cfg.keys.dir_key(&st.path(ino));
+        let path = st.path(ino);
         st.detach(ino);
         st.pin(parent);
-        st.retire_key(&key, None, self.due());
+        st.retire(&self.0.cfg, &path, None, self.due());
         drop(st);
         self.0.wake.notify_one();
         Ok(())
@@ -515,7 +563,7 @@ impl Vfs {
         self.check_writable()?;
         let mut st = self.0.st.lock();
         st.dir(parent)?;
-        let path = self.check_name(&st, parent, name, false)?;
+        let path = self.check_name(&st, parent, name)?;
         if let Some(existing) = st.child(parent, name) {
             if flags & libc::O_EXCL != 0 {
                 return Err(EEXIST);
@@ -541,8 +589,7 @@ impl Vfs {
                 committed: None,
             }),
         );
-        let key = self.0.cfg.keys.node_key(&path);
-        st.set_op(&key, PendingOp::Put(ino), None);
+        st.set_op(&path, PendingOp::Put(ino), None);
         let fh = st.add_handle(Handle::new(ino, Content::Local(file), true));
         Ok((st.attr(&self.0.cfg, ino), fh))
     }
@@ -565,7 +612,7 @@ impl Vfs {
             self.check_writable()?;
         }
         for _ in 0..3 {
-            let rd = {
+            let rf = {
                 let mut st = self.0.st.lock();
                 if let Some((content, w)) = st.open_local(ino, flags, &self.0.cfg, &self.0.store)? {
                     let keep = st.keep_cache(ino, &content, w);
@@ -574,13 +621,16 @@ impl Vfs {
                 }
                 // Copy-on-write of a remote file: fetch it all first.
                 match &st.file(ino)?.content {
-                    Content::Remote(rd) => rd.clone(),
+                    Content::Remote(rf) => rf.clone(),
                     Content::Local(_) => continue,
                 }
             };
-            let local = rd.materialize(&self.0.api).await.map_err(fetch_err)?;
+            let local = rf
+                .materialize(&self.0.api, &self.0.store)
+                .await
+                .map_err(fetch_err)?;
             let mut st = self.0.st.lock();
-            if st.make_local(ino, &rd, local, &self.0.cfg) {
+            if st.make_local(ino, &rf, local) {
                 if let Some((content, w)) = st.open_local(ino, flags, &self.0.cfg, &self.0.store)? {
                     let fh = st.add_handle(Handle::new(ino, content, w));
                     return Ok((fh, false));
@@ -609,7 +659,7 @@ impl Vfs {
                 buf.truncate(n);
                 Ok(buf)
             }
-            Content::Remote(rd) => {
+            Content::Remote(rf) => {
                 if ahead > 0 {
                     // What this read needs goes first, in a request of its
                     // own. Then the window is topped up to a whole run:
@@ -617,13 +667,13 @@ impl Vfs {
                     // request.
                     let from = offset + size as u64;
                     let mut to = from + ahead;
-                    if to < rd.size() && to / RUN * RUN > from {
+                    if to < rf.size() && to / RUN * RUN > from {
                         to = to / RUN * RUN;
                     }
-                    rd.prefetch(&self.0.api, offset, size as u64);
-                    rd.prefetch(&self.0.api, from, to - from);
+                    rf.prefetch(&self.0.api, offset, size as u64);
+                    rf.prefetch(&self.0.api, from, to - from);
                 }
-                rd.read(&self.0.api, offset, size as u64)
+                rf.read(&self.0.api, offset, size as u64)
                     .await
                     .map_err(fetch_err)
             }
@@ -633,7 +683,9 @@ impl Vfs {
     /// Reading one small remote file suggests the rest of its directory is
     /// next (`cp -r`, `diff -r`, `tar c`): fetch the small siblings in the
     /// background, so that reading them costs local I/O instead of two
-    /// ~250 ms round trips each. Once per directory, a few at a time.
+    /// ~250 ms round trips each. A layer holds its files in path order, so
+    /// a directory's small files are usually one range of it, fetched in a
+    /// few large requests. Once per directory.
     fn prefetch_siblings(&self, st: &mut State, ino: Ino) {
         let Some(parent) = st.nodes.get(&ino).map(|n| n.parent) else {
             return;
@@ -645,20 +697,56 @@ impl Vfs {
         if siblings.len() < 2 {
             return;
         }
+        // Per entry, the range the files cover.
+        struct Span {
+            rd: Arc<RemoteData>,
+            start: u64,
+            end: u64,
+            files: Vec<Arc<RemoteFile>>,
+        }
+        let mut spans: BTreeMap<i64, Span> = BTreeMap::new();
+        for rf in siblings {
+            let Some((rd, offset)) = rf.range_of() else {
+                continue;
+            };
+            let end = offset + rf.size();
+            let span = spans.entry(rd.entry.id).or_insert_with(|| Span {
+                rd: rd.clone(),
+                start: offset,
+                end,
+                files: Vec::new(),
+            });
+            span.start = span.start.min(offset);
+            span.end = span.end.max(end);
+            span.files.push(rf.clone());
+        }
         let api = self.0.api.clone();
-        tokio::spawn(async move {
-            use futures_util::StreamExt;
-            futures_util::stream::iter(siblings)
-                .for_each_concurrent(PREFETCH_CONCURRENCY, |rd| {
-                    let api = api.clone();
-                    async move {
-                        if let Err(e) = rd.ensure(&api, 0, rd.size()).await {
-                            tracing::debug!("prefetch: {e}");
+        for Span {
+            rd,
+            start,
+            end,
+            files,
+        } in spans.into_values()
+        {
+            if end - start <= PREFETCH_MAX_SPAN {
+                rd.prefetch(&api, start, end - start);
+                continue;
+            }
+            let api = api.clone();
+            tokio::spawn(async move {
+                use futures_util::StreamExt;
+                futures_util::stream::iter(files)
+                    .for_each_concurrent(PREFETCH_CONCURRENCY, |rf| {
+                        let api = api.clone();
+                        async move {
+                            if let Err(e) = rf.ensure(&api, 0, rf.size()).await {
+                                tracing::debug!("prefetch: {e}");
+                            }
                         }
-                    }
-                })
-                .await;
-        });
+                    })
+                    .await;
+            });
+        }
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
@@ -684,6 +772,16 @@ impl Vfs {
         let mut st = self.0.st.lock();
         if let Ok(f) = st.file_mut(ino) {
             f.writes_inflight -= 1;
+            if result.is_err() && f.writes_inflight == 0 {
+                // The size grew in advance; take it from the file instead,
+                // so that it never claims bytes the file does not have.
+                if let (Content::Local(cur), Ok(len)) = (&f.content, file.size()) {
+                    if Arc::ptr_eq(cur, &file) {
+                        f.size = len;
+                        f.generation += 1;
+                    }
+                }
+            }
         }
         result.map_err(io_err)?;
         Ok(data.len() as u32)
@@ -692,7 +790,7 @@ impl Vfs {
     pub fn release(&self, fh: u64) -> Result<()> {
         let mut st = self.0.st.lock();
         let h = st.handles.remove(&fh).ok_or(EBADF)?;
-        st.close_handle(&h, &self.0.cfg, &self.0.store, self.due());
+        st.close_handle(&h, self.due());
         drop(st);
         self.0.wake.notify_one();
         Ok(())
@@ -700,17 +798,17 @@ impl Vfs {
 
     /// Uploads the file now and waits: the durability point.
     pub async fn fsync(&self, fh: u64) -> Result<()> {
-        let key = {
+        let path = {
             let mut st = self.0.st.lock();
             let ino = st.handles.get(&fh).ok_or(EBADF)?.ino;
             let Ok(f) = st.file(ino) else { return Ok(()) };
             if !f.dirty || !st.node(ino)?.attached {
                 return Ok(());
             }
-            let key = self.0.cfg.keys.node_key(&st.path(ino));
-            st.overlay.get_mut(&key).ok_or(EIO)?.force = true;
-            st.schedule(&key, Some(Instant::now()));
-            key
+            let path = st.path(ino);
+            st.overlay.get_mut(&path).ok_or(EIO)?.force = true;
+            st.schedule(&path, Some(Instant::now()));
+            path
         };
         self.0.wake.notify_one();
         loop {
@@ -719,7 +817,7 @@ impl Vfs {
             notified.as_mut().enable();
             {
                 let st = self.0.st.lock();
-                match st.overlay.get(&key) {
+                match st.overlay.get(&path) {
                     None => return Ok(()),
                     Some(p) if p.failed => return Err(EIO),
                     Some(p) if !matches!(p.op, PendingOp::Put(_)) => return Ok(()),
@@ -745,13 +843,13 @@ impl Vfs {
         self.check_writable()?;
         // Changing a remote file is copy-on-write.
         for _ in 0..3 {
-            let rd = {
+            let rf = {
                 let st = self.0.st.lock();
                 match &st.file(ino)?.content {
                     Content::Local(_) => None,
-                    Content::Remote(rd) => {
+                    Content::Remote(rf) => {
                         let f = st.file(ino)?;
-                        let unchanged = set.size.is_none_or(|s| s == rd.size())
+                        let unchanged = set.size.is_none_or(|s| s == rf.size())
                             && set.mode.is_none_or(|m| (m & 0o7777) as u16 == f.mode)
                             && set
                                 .mtime
@@ -759,18 +857,20 @@ impl Vfs {
                         if unchanged {
                             return Ok(st.attr(&self.0.cfg, ino));
                         }
-                        Some(rd.clone())
+                        Some(rf.clone())
                     }
                 }
             };
-            if let Some(rd) = rd {
+            if let Some(rf) = rf {
                 let local = if set.size == Some(0) {
                     self.0.store.create().map_err(io_err)?
                 } else {
-                    rd.materialize(&self.0.api).await.map_err(fetch_err)?
+                    rf.materialize(&self.0.api, &self.0.store)
+                        .await
+                        .map_err(fetch_err)?
                 };
                 let mut st = self.0.st.lock();
-                if !st.make_local(ino, &rd, local, &self.0.cfg) {
+                if !st.make_local(ino, &rf, local) {
                     continue;
                 }
             }
@@ -797,10 +897,10 @@ impl Vfs {
             if set.size.is_some() {
                 st.bump_epoch(ino);
             }
-            let key = self.0.cfg.keys.node_key(&st.path(ino));
+            let path = st.path(ino);
             if st.node(ino)?.attached {
                 st.set_op(
-                    &key,
+                    &path,
                     PendingOp::Put(ino),
                     if writers == 0 { due } else { None },
                 );
@@ -813,9 +913,16 @@ impl Vfs {
         Err(EIO)
     }
 
-    /// Metadata changes on directories and symlinks live only in this mount.
+    /// `chmod` and `utimens` of directories (an `attrs` mark) and symlinks.
     fn setattr_meta(&self, ino: Ino, set: &SetAttr) -> Result<Attr> {
         let mut st = self.0.st.lock();
+        st.node(ino)?;
+        if set.mode.is_none() && set.mtime.is_none() {
+            return Ok(st.attr(&self.0.cfg, ino));
+        }
+        self.check_writable()?;
+        let path = st.path(ino);
+        let attached = st.node(ino)?.attached;
         match &mut st.node_mut(ino)?.body {
             Body::Dir(d) => {
                 if let Some(mode) = set.mode {
@@ -824,15 +931,25 @@ impl Vfs {
                 if let Some(t) = set.mtime {
                     d.mtime = t.resolve();
                 }
+                d.mark.get_or_insert(Mark::Attrs);
+                d.generation += 1;
             }
             Body::Symlink(s) => {
                 if let Some(t) = set.mtime {
                     s.mtime = t.resolve();
                 }
+                s.dirty = true;
+                s.generation += 1;
             }
-            Body::File(_) => {}
+            Body::File(_) => return Ok(st.attr(&self.0.cfg, ino)),
         }
-        Ok(st.attr(&self.0.cfg, ino))
+        if attached {
+            st.set_op(&path, PendingOp::Put(ino), self.due());
+        }
+        let attr = st.attr(&self.0.cfg, ino);
+        drop(st);
+        self.0.wake.notify_one();
+        Ok(attr)
     }
 
     pub fn unlink(&self, parent: Ino, name: &str) -> Result<()> {
@@ -843,10 +960,10 @@ impl Vfs {
         if matches!(st.node(ino)?.body, Body::Dir(_)) {
             return Err(EISDIR);
         }
-        let key = self.0.cfg.keys.node_key(&st.path(ino));
+        let path = st.path(ino);
         st.detach(ino);
         st.pin(parent);
-        st.retire_key(&key, None, self.due());
+        st.retire(&self.0.cfg, &path, None, self.due());
         drop(st);
         self.0.wake.notify_one();
         Ok(())
@@ -856,53 +973,39 @@ impl Vfs {
         self.check_writable()?;
         let mut st = self.0.st.lock();
         st.dir(parent)?;
-        let path = self.check_name(&st, parent, name, false)?;
+        let path = self.check_name(&st, parent, name)?;
         if st.child(parent, name).is_some() {
             return Err(EEXIST);
         }
-        if target.is_empty() {
+        // EROFS keeps a symlink's target in one block.
+        if target.is_empty() || target.len() > 4096 {
             return Err(EINVAL);
         }
         let ino = st.alloc(
             parent,
             name,
             Body::Symlink(Symlink {
-                target: Some(target.to_string()),
-                remote: None,
+                target: target.to_string(),
+                id: None,
                 mtime: SystemTime::now(),
                 dirty: true,
                 generation: 1,
             }),
         );
-        let key = self.0.cfg.keys.node_key(&path);
-        st.set_op(&key, PendingOp::Put(ino), self.due());
+        st.set_op(&path, PendingOp::Put(ino), self.due());
+        let attr = st.attr(&self.0.cfg, ino);
         drop(st);
         self.0.wake.notify_one();
-        let st = self.0.st.lock();
-        Ok(st.attr(&self.0.cfg, ino))
+        Ok(attr)
     }
 
+    /// Targets arrive with the layers' metadata, so this never waits.
     pub async fn readlink(&self, ino: Ino) -> Result<String> {
-        let rd = {
-            let st = self.0.st.lock();
-            let Body::Symlink(s) = &st.node(ino)?.body else {
-                return Err(EINVAL);
-            };
-            if let Some(t) = &s.target {
-                return Ok(t.clone());
-            }
-            s.remote.clone().ok_or(EIO)?
-        };
-        let bytes = rd
-            .read(&self.0.api, 0, rd.size())
-            .await
-            .map_err(fetch_err)?;
-        let target = String::from_utf8(bytes).map_err(|_| EIO)?;
-        let mut st = self.0.st.lock();
-        if let Ok(Body::Symlink(s)) = st.node_mut(ino).map(|n| &mut n.body) {
-            s.target = Some(target.clone());
+        let st = self.0.st.lock();
+        match &st.node(ino)?.body {
+            Body::Symlink(s) => Ok(s.target.clone()),
+            _ => Err(EINVAL),
         }
-        Ok(target)
     }
 
     pub async fn rename(
@@ -915,13 +1018,12 @@ impl Vfs {
     ) -> Result<()> {
         self.check_writable()?;
         for _ in 0..3 {
-            // A remote source is only renamed if its content is already local
-            // (it is copied) or it is a symlink (its target is fetched).
+            // A remote file is only renamed if its content is already local
+            // (it is copied).
             let need = {
                 let mut st = self.0.st.lock();
                 match st.rename(
                     &self.0.cfg,
-                    &self.0.store,
                     parent,
                     name,
                     newparent,
@@ -937,18 +1039,15 @@ impl Vfs {
                     Some(need) => need,
                 }
             };
-            match need {
-                state::RenameNeeds::Copy(ino, rd) => {
-                    if !rd.fully_present() {
-                        return Err(EXDEV);
-                    }
-                    let local = rd.materialize(&self.0.api).await.map_err(fetch_err)?;
-                    self.0.st.lock().make_local(ino, &rd, local, &self.0.cfg);
-                }
-                state::RenameNeeds::Target(ino) => {
-                    self.readlink(ino).await?;
-                }
+            let state::RenameNeeds::Copy(ino, rf) = need;
+            if !rf.present() {
+                return Err(EXDEV);
             }
+            let local = rf
+                .materialize(&self.0.api, &self.0.store)
+                .await
+                .map_err(fetch_err)?;
+            self.0.st.lock().make_local(ino, &rf, local);
         }
         Err(EXDEV)
     }
@@ -969,7 +1068,7 @@ impl Vfs {
         self.0.draining.store(true, Ordering::SeqCst);
         {
             let mut st = self.0.st.lock();
-            st.prepare_drain(&self.0.cfg, &self.0.store);
+            st.prepare_drain();
         }
         self.0.wake.notify_one();
         loop {
@@ -998,9 +1097,10 @@ impl Vfs {
             uploaded_bytes: s.uploaded_bytes.load(Ordering::Relaxed),
             whiteouts: s.whiteouts.load(Ordering::Relaxed),
             dir_markers: s.dir_markers.load(Ordering::Relaxed),
+            layers: s.layers.load(Ordering::Relaxed),
+            blobs: s.blobs.load(Ordering::Relaxed),
             download_requests: self.0.store.stats.requests.load(Ordering::Relaxed),
             downloaded_bytes: self.0.store.stats.bytes.load(Ordering::Relaxed),
-            gc_deleted: s.gc_deleted.load(Ordering::Relaxed),
             touched: s.touched.load(Ordering::Relaxed),
             requests: api.requests(),
             rate_limited: api.rate_limited.load(Ordering::Relaxed),
@@ -1032,6 +1132,9 @@ const READAHEAD_MAX: u64 = 64 * CHUNK;
 const PREFETCH_MAX_SIZE: u64 = CHUNK;
 const PREFETCH_MAX_FILES: usize = 256;
 const PREFETCH_CONCURRENCY: usize = 6;
+/// A directory's small files in one layer are fetched as one range when it
+/// is at most this long.
+const PREFETCH_MAX_SPAN: u64 = 32 * CHUNK;
 
 /// How long a lookup of a missing name waits for the refresh it starts.
 const REFRESH_WAIT: Duration = Duration::from_secs(2);
@@ -1039,11 +1142,36 @@ const REFRESH_WAIT: Duration = Duration::from_secs(2);
 /// How often an unmount checks whether everything is done.
 const DRAIN_CHECK: Duration = Duration::from_millis(20);
 
-/// Touching entries nothing reads: those last used this long ago, at most
-/// this many per mount (the stalest first), this many at once.
+/// Touching blobs nothing read: those last used this long ago, at most this
+/// many per mount (the stalest first), this many at once.
 const TOUCH_AFTER: Duration = Duration::from_secs(3 * 24 * 3600);
 const TOUCH_MAX: usize = 1000;
 const TOUCH_CONCURRENCY: usize = 4;
+
+/// Listed items that are new: layers, whose metadata must be read, and
+/// blobs; and how many are not ours.
+#[allow(clippy::type_complexity)]
+fn sort_items(
+    index: &Index,
+    items: &[crate::api::CacheItem],
+) -> (
+    Vec<(index::Listed, u32)>,
+    Vec<(index::Listed, String)>,
+    usize,
+) {
+    let (mut layers, mut blobs, mut foreign) = (Vec::new(), Vec::new(), 0);
+    let mut new = std::collections::HashSet::new();
+    for item in items {
+        match index.classify(item) {
+            Some(_) if !new.insert(item.id) => {}
+            Some(Item::Layer { entry, meta_blocks }) => layers.push((entry, meta_blocks)),
+            Some(Item::Blob { entry, sha }) => blobs.push((entry, sha)),
+            None if Version::decode(&item.version).is_none() => foreign += 1,
+            None => {}
+        }
+    }
+    (layers, blobs, foreign)
+}
 
 impl Handle {
     fn new(ino: Ino, content: Content, writable: bool) -> Handle {
@@ -1077,4 +1205,5 @@ pub fn _assert_send_sync() {
     f::<Vfs>();
     f::<Arc<DataFile>>();
     f::<Arc<RemoteData>>();
+    f::<Arc<RemoteFile>>();
 }

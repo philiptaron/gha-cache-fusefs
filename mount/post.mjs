@@ -19,9 +19,9 @@ function report(path, summary) {
   const lines = [
     `### Cache mount \`${path}\``,
     '',
-    '| uploaded files | uploaded | whiteouts | directory markers | downloaded | failures |',
-    '|---:|---:|---:|---:|---:|---:|',
-    `| ${summary.uploaded_files} | ${human(summary.uploaded_bytes)} | ${summary.whiteouts} | ${summary.dir_markers} | ${human(summary.downloaded_bytes)} | ${summary.failures.length} |`,
+    '| uploaded files | uploaded | whiteouts | directory marks | layers | blobs | downloaded | failures |',
+    '|---:|---:|---:|---:|---:|---:|---:|---:|',
+    `| ${summary.uploaded_files} | ${human(summary.uploaded_bytes)} | ${summary.whiteouts} | ${summary.dir_markers} | ${summary.layers ?? 0} | ${summary.blobs ?? 0} | ${human(summary.downloaded_bytes)} | ${summary.failures.length} |`,
     '',
   ];
   const q = summary.requests;
@@ -30,8 +30,8 @@ function report(path, summary) {
     const paused = Math.round((summary.rate_limit_pause_ms ?? 0) / 1000);
     lines.push(
       `:hourglass: Rate limited ${summary.rate_limited} times, which held up uploads (or listings) for ${paused} s. ` +
-        'Every file, empty directory, and deletion is a new cache entry, and the service allows about 200 per ~45 s ' +
-        'per repository; packing small files (tar, squashfs, zip) avoids the wait.',
+        'Each batch of changes is one layer, and each file over 8 MiB one blob; the service allows about 200 new ' +
+        'cache entries per ~45 s per repository. Frequent fsyncs make a layer each.',
       ''
     );
   }

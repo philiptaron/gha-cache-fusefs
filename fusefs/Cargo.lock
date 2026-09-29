@@ -477,6 +477,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

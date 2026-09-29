@@ -13,7 +13,7 @@ use gha_cache_fusefs::api::Api;
 use gha_cache_fusefs::bench;
 use gha_cache_fusefs::config::Env;
 use gha_cache_fusefs::data::DataStore;
-use gha_cache_fusefs::entry::KeySpace;
+use gha_cache_fusefs::entry::Volume;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer};
 use gha_cache_fusefs::vfs::{Summary, Vfs, VfsConfig};
 
@@ -50,9 +50,12 @@ enum Cmd {
 #[derive(Args)]
 struct MountArgs {
     mountpoint: PathBuf,
-    /// The cache key prefix the mount root corresponds to.
-    #[arg(long, default_value = "fusefs/")]
-    prefix: String,
+    /// The volume to mount: its entries are the keys under `gha-fs/<volume>/`.
+    #[arg(long, env = "GHA_CACHE_FUSEFS_VOLUME", default_value = "default")]
+    volume: String,
+    /// The directory of the volume to show at the mountpoint, such as `a/b`.
+    #[arg(long, env = "GHA_CACHE_FUSEFS_ROOT", default_value = "")]
+    root: String,
     /// Where the log, lock, summary, and cached data live.
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -74,9 +77,6 @@ struct MountArgs {
     upload_concurrency: usize,
     #[arg(long, default_value_t = 16)]
     download_concurrency: usize,
-    /// Delete entries that newer writes superseded (needs `actions: write`).
-    #[arg(long)]
-    gc: bool,
     /// Let other users access the mount (needs `user_allow_other` or root).
     #[arg(long)]
     allow_other: bool,
@@ -154,10 +154,10 @@ struct BenchArgs {
     entries: Option<usize>,
     #[arg(long)]
     random_reads: Option<usize>,
-    /// With `--service real`: the key prefix to work below; a directory for
-    /// this run is added.
-    #[arg(long, default_value = "bench/")]
-    prefix: String,
+    /// With `--service real`: the start of the volume names to use; the
+    /// run and the scenario are added.
+    #[arg(long, default_value = "bench")]
+    volume: String,
     /// Also write the results as JSON.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -374,12 +374,14 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
             env.default_branch = api.rest.default_branch().await.ok();
         }
         let store = DataStore::new(&state_dir.join("data"), args.cache_size_mb << 20, args.download_concurrency)?;
-        let mut cfg = VfsConfig::new(KeySpace::new(&args.prefix));
+        let volume = Volume::new(&args.volume).map_err(anyhow::Error::msg)?;
+        let mut cfg = VfsConfig::new(volume)
+            .with_root(&args.root)
+            .map_err(anyhow::Error::msg)?;
         cfg.read_only = read_only;
         cfg.settle = args.settle;
         cfg.refresh = (!args.refresh.is_zero()).then_some(args.refresh);
         cfg.upload_concurrency = args.upload_concurrency;
-        cfg.gc = args.gc;
         tracing::info!("scopes: {:?}", env.scopes());
         Vfs::load(cfg, api, store, env.scopes()).await.context(
             "listing the cache failed; the REST API token needs `actions: read` (see `permissions:`)",
@@ -387,8 +389,13 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
     })?;
     let session = mount_fuse(args, &vfs, &rt, read_only)?;
     let info = format!(
-        "mounted {:?} at {} ({}) in {:.1}s",
-        args.prefix,
+        "mounted volume {:?}{} at {} ({}) in {:.1}s",
+        args.volume,
+        if args.root.is_empty() {
+            String::new()
+        } else {
+            format!(" at {:?}", args.root)
+        },
         args.mountpoint.display(),
         if read_only { "read-only" } else { "read-write" },
         started.elapsed().as_secs_f64()
@@ -407,11 +414,13 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
         &serde_json::to_vec_pretty(&summary)?,
     )?;
     tracing::info!(
-        "uploaded {} files ({} bytes), {} whiteouts, {} directory markers; {} failures",
+        "uploaded {} files ({} bytes), {} whiteouts, and {} directory marks in {} layers and {} blobs; {} failures",
         summary.uploaded_files,
         summary.uploaded_bytes,
         summary.whiteouts,
         summary.dir_markers,
+        summary.layers,
+        summary.blobs,
         summary.failures.len()
     );
     for f in &summary.failures {
@@ -683,8 +692,9 @@ fn bench(args: BenchArgs, log: &str) -> anyhow::Result<ExitCode> {
                         .as_secs()
                         .to_string(),
                 };
-                let prefix = format!("{}{run}/", KeySpace::new(&args.prefix).prefix());
-                bench::Service::Real { env, prefix }
+                let volume = format!("{}-{run}", args.volume);
+                Volume::new(&volume).map_err(anyhow::Error::msg)?;
+                bench::Service::Real { env, volume }
             }
         };
         bench::run(&service, &sizes, &args.only).await
