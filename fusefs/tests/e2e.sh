@@ -29,7 +29,8 @@ fail() {
   exit 1
 }
 # Deterministic pseudo-random data, so later phases can regenerate it.
-gen() { openssl enc -aes-256-ctr -pbkdf2 -pass "pass:$1" -nosalt </dev/zero 2>/dev/null | head -c "$2"; }
+# (openssl dies of SIGPIPE when head has enough; only head's status matters.)
+gen() { { openssl enc -aes-256-ctr -pbkdf2 -pass "pass:$1" -nosalt </dev/zero 2>/dev/null || true; } | head -c "$2"; }
 hash() { sha256sum | cut -d' ' -f1; }
 same() { [ "$(hash <"$1")" = "$(gen "$2" "$3" | hash)" ] || fail "$1 does not match gen $2 $3"; }
 refuses() { if "$@" 2>/dev/null; then fail "expected this to fail: $*"; fi; }
@@ -179,9 +180,11 @@ read_phase() {
   cmp synced big5 || fail "fsync'd file"
 
   log "random access into a large file"
-  dd if=big40 bs=4096 skip=5000 count=1 status=none | hash >"$WORK/slice"
-  gen big40 $((40 << 20)) | dd bs=4096 skip=5000 count=1 iflag=fullblock status=none | hash | cmp - "$WORK/slice" ||
-    fail "random read"
+  gen big40 $((40 << 20)) >"$WORK/big40"
+  for block in 5000 17 9999 3; do
+    cmp <(dd if=big40 bs=4096 skip=$block count=1 status=none) \
+      <(dd if="$WORK/big40" bs=4096 skip=$block count=1 status=none) || fail "random read of block $block"
+  done
 
   if [ -f image.sqfs ] && command -v squashfuse >/dev/null; then
     log "a squashfs image, mounted lazily out of the cache"

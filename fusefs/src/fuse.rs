@@ -450,6 +450,41 @@ impl Filesystem for FuseFs {
         );
     }
 
+    // Extended attributes are not stored. ENOSYS (rather than ENODATA) makes
+    // the kernel stop asking, which saves a round trip per write for the
+    // security.capability check; the defaults would say so in the log.
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        reply.error(fuser::Errno::ENOSYS);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: fuser::ReplyXattr) {
+        reply.error(fuser::Errno::ENOSYS);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(fuser::Errno::ENOSYS);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(fuser::Errno::ENOSYS);
+    }
+
     fn create(
         &self,
         _req: &Request,
