@@ -596,3 +596,44 @@ async fn a_whole_tree() {
     let l = lookup(&b, "latest").await.unwrap();
     assert_eq!(b.readlink(l.ino).await.unwrap(), "bin/tool");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reading_one_small_file_prefetches_its_siblings() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "src", 0o755).unwrap();
+    for i in 0..20u64 {
+        write_file(&a, d.ino, &format!("f{i:02}"), &noise(3000, i));
+    }
+    write_file(&a, d.ino, "big", &noise(3 << 20, 99));
+    drained(&a).await;
+
+    let b = job(&server, MAIN).await;
+    assert_eq!(cat(&b, "src/f00").await, noise(3000, 0));
+    // Wait for the background fetches to settle.
+    let mut last = server.blob_requests();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = server.blob_requests();
+        if now == last && now > 1 {
+            break;
+        }
+        last = now;
+    }
+    let before = server.blob_requests();
+    assert!(
+        before >= 20,
+        "siblings were not prefetched: {before} blob requests"
+    );
+    for i in 1..20u64 {
+        assert_eq!(cat(&b, &format!("src/f{i:02}")).await, noise(3000, i));
+    }
+    assert_eq!(
+        server.blob_requests(),
+        before,
+        "a prefetched file was fetched again"
+    );
+    // Large files are left alone until they are read.
+    assert_eq!(cat(&b, "src/big").await, noise(3 << 20, 99));
+    assert!(server.blob_requests() > before);
+}

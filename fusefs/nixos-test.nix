@@ -39,6 +39,7 @@
 
     with subtest("the daemon leaves nothing behind"):
         machine.fail("mountpoint -q /mnt/cache")
-        machine.succeed("test -z \"$(pgrep -f 'gha-cache-fusefs mount')\"")
+        # The brackets keep pgrep from matching the shell that runs it.
+        machine.fail("pgrep -f '[g]ha-cache-fusefs mount'")
   '';
 }

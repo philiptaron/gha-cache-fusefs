@@ -1,7 +1,7 @@
 //! The mutable state behind the filesystem's lock: inodes, handles, the remote
 //! index, and the overlay of pending operations.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -84,6 +84,8 @@ pub(super) struct Handle {
     /// Where a sequential reader would read next.
     pub next: u64,
     pub window: u64,
+    /// Whether this handle has read anything yet.
+    pub has_read: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +127,8 @@ pub(super) struct State {
     pub index: Index,
     pub overlay: BTreeMap<String, Pending>,
     pub last_refresh: Instant,
+    /// Directories whose small files were already prefetched.
+    pub prefetched_dirs: HashSet<Ino>,
 }
 
 impl State {
@@ -158,7 +162,31 @@ impl State {
             index,
             overlay: BTreeMap::new(),
             last_refresh: Instant::now(),
+            prefetched_dirs: HashSet::new(),
         }
+    }
+
+    /// Remote files in `dir` small enough to fetch speculatively.
+    pub fn small_remote_files(
+        &self,
+        dir: Ino,
+        max_size: u64,
+        limit: usize,
+    ) -> Vec<Arc<RemoteData>> {
+        let Ok(d) = self.dir(dir) else {
+            return Vec::new();
+        };
+        d.children
+            .values()
+            .filter_map(|c| match self.nodes.get(c).map(|n| &n.body) {
+                Some(Body::File(File {
+                    content: Content::Remote(rd),
+                    ..
+                })) if (1..=max_size).contains(&rd.size()) => Some(rd.clone()),
+                _ => None,
+            })
+            .take(limit)
+            .collect()
     }
 
     // ---- accessors --------------------------------------------------------
