@@ -94,3 +94,8 @@ typings/
 
 # Text editor files
 .vscode/
+
+# gha-cache-fusefs
+fusefs/target/
+result
+result-*
