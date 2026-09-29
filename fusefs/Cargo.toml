@@ -19,6 +19,9 @@ hex = "0.4"
 humantime = "2"
 libc = "0.2"
 parking_lot = "0.12"
+# Already rustls's crypto provider; its SHA-256 uses the CPU's instructions,
+# where sha2 0.10 only does on x86_64. It hashes blobs (LAYERS.md §2).
+ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "query"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"

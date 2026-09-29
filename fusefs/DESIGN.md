@@ -110,84 +110,83 @@ Non-goals:
 
 ## 3. Mapping the filesystem onto cache entries
 
-### 3.1 Keys
+[LAYERS.md](LAYERS.md) specifies the format, format 2. This section is its
+outline. Format 1 stored one entry per file, with the path as the key and
+the inode in the version. It needed a creation for every file, symlink,
+empty directory, and deletion, which the rate limit turned into minutes
+(PERFORMANCE.md). Mounts ignore its entries, which expire within a week.
 
-A mount is rooted at a key prefix `P` (default `fusefs/`; always normalized to
-end in `/`). Paths map to keys like this:
+### 3.1 Volumes, layers, and blobs
 
-| Filesystem object     | Cache key          |
-|-----------------------|--------------------|
-| file or symlink `a/b` | `P` + `a/b`        |
-| directory `a/b`       | `P` + `a/b/`       |
+A mount shows a **volume** (default `default`), whose entries are the keys
+under `gha-fs/<volume>/`:
 
-Directories are *implicit*: `a/` exists because `P/a/b` exists. An explicit
-directory entry (a "marker") is only written for directories that would
-otherwise vanish, such as empty ones. Keys over 512 characters give
-`ENAMETOOLONG`. Names must be valid UTF-8; listed keys with empty, `.` or `..`
-components are ignored.
+| entry | key | content |
+|---|---|---|
+| layer | `gha-fs/<volume>/layer/<nonce>` | an EROFS image of one batch of changes |
+| blob | `gha-fs/<volume>/blob/<sha256>` | the bytes of one file over 8 MiB |
 
-### 3.2 Versions carry metadata
+Keys hold no paths, so paths have no length limit beyond the 255-byte names
+EROFS takes. `--root` shows a directory of the volume instead of all of it.
+Names must be valid UTF-8.
+
+A **layer** holds files (up to 1 KiB inline in its metadata, up to 8 MiB in
+whole blocks after it), symlinks, whiteouts, and directories. Its first M
+blocks, the metadata, describe its whole tree, so one ranged GET lists it.
+Directories are implicit, as in overlayfs, unless a layer marks them with
+the xattr `user.gha-fs.dir`: `keep` after `mkdir` (the directory exists
+even when empty), `attrs` after `chmod` or `utimens`, and `drop` after
+`rmdir`. Files over 8 MiB live in **blobs**, which layers refer to through
+EROFS's device table, by digest; a blob a readable scope already has is not
+uploaded again.
+
+### 3.2 Versions say what an entry is
 
 The version field is the only per-entry metadata the service stores and the
-REST listing returns. Since any 64-hex string is accepted, the version encodes
-the inode:
+REST listing returns. It says which kind of entry this is and, for a layer,
+how long its metadata is:
 
 ```
 bytes  field
-0..8   magic   = sha256("gha-cache-fusefs/v1")[0..8]
-8      kind    1 = file, 2 = directory marker, 3 = symlink, 4 = whiteout
-9      flags   bit 0 = EMPTY (blob is a 1-byte placeholder; logical size 0)
-10..12 mode    permission bits, big-endian u16
-12..16 reserved (zero)
-16..24 mtime   nanoseconds since the Unix epoch, big-endian i64
-24..32 nonce   random; makes every write a distinct (key, version)
+0..8   magic  = sha256("gha-cache-fusefs/v2")[0..8]
+8      kind   1 = layer, 2 = blob
+12..16 layers: metadata size M in 4 KiB blocks (big-endian u32)
+24..32 nonce  random; makes every upload a distinct (key, version)
 ```
 
-This has several consequences:
+The other bytes are zero. Entries from other tools (for example
+`actions/cache` tarballs) lack the magic and are ignored, even among the
+volume's keys, and an abandoned reservation only burns a nonce nobody will
+reuse. Inode metadata (mode, mtime with nanoseconds, size) lives in the
+layers' 64-byte EROFS inodes, so once a mount has read the layers' metadata,
+`stat` never touches the network.
 
-* `stat` never touches the network. Kind, mode, mtime, and size all come from
-  the listing.
-* **Empty files** are stored as a 1-byte placeholder blob with `EMPTY` set.
-* **Symlinks** are entries whose blob is the link target.
-* **Overwriting** a file never conflicts. The new write has a fresh nonce, so
-  it is a new entry, and the newest one wins (§3.3).
-* **Deleting** needs no extra permissions. It writes a *whiteout* (kind 4),
-  as overlayfs does.
-* Entries from other tools (for example `actions/cache` tarballs) lack the
-  magic and are ignored.
-* An abandoned reservation only burns a nonce nobody will reuse.
-
-### 3.3 Scopes form an overlay
+### 3.3 Scopes and layers form an overlay
 
 A run can read the caches of several scopes: its own ref (`GITHUB_REF`, e.g.
 `refs/pull/7/merge`), the pull request's base branch, and the default branch.
-It can only write its own ref. The mount lists each readable scope via REST
-and resolves every key with two rules:
+It can only write its own ref. The mount lists `gha-fs/<volume>/` in each
+readable scope and stacks the layers, oldest at the bottom:
 
-1. **Scope precedence:** current ref > PR base > default branch. The upper
-   layer shadows the lower ones, whatever the timestamps.
-2. **Within a scope, the newest entry wins**, ordered by
-   `(created_at, id)`.
+1. **by scope:** default branch, then PR base, then the current ref, so a
+   nearer scope shadows farther ones whatever the timestamps;
+2. **within a scope, by `(created_at, id)`.**
 
-If the winner is a whiteout, the key does not exist. Deleting on a feature
-branch hides the default branch's file on that branch only, which is how
-overlayfs behaves and how cache scoping already works. With `--gc` (and a
-token with `actions: write`), entries in the current scope that a newer write
-superseded are deleted in the background. It is off by default: another job
-may still be reading an old version, and unread garbage is what the cache's
-LRU eviction removes first anyway.
+Applying the layers bottom up gives the tree. A file or symlink replaces
+whatever is at its path, and a directory merges with a directory. A whiteout
+removes a file or symlink, but leaves a directory alone: whiteouts are only
+written for what the deleting job saw, so a concurrent job's new files in
+the same directory survive. Deleting on a feature branch hides the default
+branch's file on that branch only, which is how overlayfs behaves and how
+cache scoping already works.
 
-A file entry and a directory can collide, for example when two jobs write
-`a` and `a/b` concurrently. The directory wins and the file is hidden.
-
-The service evicts an entry a week after its last *download*, and nothing
-ever downloads a whiteout, a directory marker, or an empty file. Left alone,
-a branch's deletions would come back after a week, and empty files and
-directories would vanish from trees in daily use. So a mount resolves a
-download URL, which counts as use, for such entries it depends on that were
-last used more than three days ago: markers, empty files, and whiteouts that
-hide something. It resolves at most 1,000 per mount, the stalest first.
-Regular files are left to reads, as the cache's LRU intends.
+The service evicts an entry a week after its last *download*. Every mount
+reads every layer's metadata, which keeps layers alive while the volume is
+in use. Blobs are downloaded only when read, so a mount touches (resolves a
+download URL for) the blobs of visible files that were last used more than
+three days ago, at most 1,000 per mount, the stalest first. Layers
+accumulate; snapshots, which would let old ones expire, are future work
+(LAYERS.md §8).
 
 ## 4. Architecture
 
@@ -198,8 +197,8 @@ Regular files are left to reads, as the cache's LRU intends.
                             │  tree of inodes = remote view ⊕ local overlay            │
                             └──────┬───────────────────┬───────────────────┬───────────┘
                                    │                   │                   │
-                         Index (REST listing,   DataStore (local       Committer (settle,
-                          scopes, refresh)       sparse files)          upload, whiteout)
+                         Index (listing, layer  DataStore (local       Committer (settle,
+                          metadata, stacking)    sparse files)          batch, layer)
                                    │                   │                   │
                           GitHub REST API     Azure Blob (SAS, Range)   Twirp CacheService
 ```
@@ -210,22 +209,27 @@ Regular files are left to reads, as the cache's LRU intends.
   so throttled creations never hold up downloads. REST requests fail rather
   than wait more than a minute, since an exhausted `GITHUB_TOKEN` budget can
   take an hour to reset. SAS signatures are redacted from all logs.
-* **`index`** keeps the per-scope listings and computes the merged *remote
-  view*. The initial listing pages are fetched in parallel. Pages are cut by
-  position, so an entry deleted while we page would hide another at a page
-  boundary. Every page reports the total, and a listing whose pages disagree
-  is repeated. A refresh is incremental: it reads pages sorted by
-  `created_at desc` only until it passes the previous high-water mark (minus
-  a margin for clock skew).
+* **`index`** lists the volume in every readable scope, reads the metadata
+  of each layer, and stacks the layers into the *remote view*: every path
+  that exists, with its node. The initial listing pages are fetched in
+  parallel. Pages are cut by position, so an entry deleted while we page
+  would hide another at a page boundary. Every page reports the total, and a
+  listing whose pages disagree is repeated. A refresh is incremental: it
+  reads pages sorted by `created_at desc` only until it passes the previous
+  high-water mark (minus a margin for clock skew). Any change of the layers
+  restacks them all and reports the paths whose nodes changed.
+* **`erofs`** writes and reads the EROFS subset of LAYERS.md §3.
 * **`vfs`** is the FUSE-agnostic core. It owns the inode tree, the **local
-  overlay** (operations not yet committed; one op per key, latest wins), open
-  handles, and directory snapshots. Every operation returns
+  overlay** (operations not yet committed; one op per path, latest wins),
+  open handles, and directory snapshots. Every operation returns
   `Result<_, errno>`, and the tests drive it without a kernel.
 * **`data`** manages local backing files. For content we wrote, the backing
-  file is authoritative. For remote content, it is a sparse cache with a 1 MiB
-  presence bitmap. Clean files are evicted LRU above `--cache-size-mb`.
+  file is authoritative. For remote content, there is one sparse cache per
+  layer or blob, with a 1 MiB presence bitmap, and a file is a range of one.
+  Caches are evicted LRU above `--cache-size-mb`.
 * **`commit`** runs the upload pipeline. It takes operations from a queue
-  ordered by due time, so its cost follows what is due, not what is pending.
+  ordered by due time, so its cost follows what is due, not what is pending,
+  and turns each batch of them into a layer.
 * **`fuse`** is a thin `fuser::Filesystem` adapter. Requests that stay in
   memory or on local disk (`getattr`, `readdir`, `write`, `create`, …) are
   answered on the FUSE thread; any that may touch the network (`lookup`,
@@ -237,58 +241,71 @@ Regular files are left to reads, as the cache's LRU intends.
 1. `create`/`mknod` allocates an inode backed by a fresh local file and
    records `Put(ino)` in the overlay. Writes may land at any offset, and
    truncation and seeking work, because the data is an ordinary local file.
-2. When the last writable handle is released, the key is scheduled for commit
-   after a **settle delay** (default 1 s). Anything that touches the inode in
-   that window (reopen, rename, chmod, utimens, unlink) is simply folded in.
-   This is what makes the ubiquitous *write-temp-then-rename* pattern (Nix,
-   Bazel, Cargo, editors) upload only the final name.
-3. **Commit** snapshots the inode's metadata and a content generation counter,
-   encodes a version, then:
-   * calls `CreateCacheEntry`,
-   * uploads with `Put Blob` (≤ 16 MiB) or with 8 MiB `Put Block`s, four in
-     flight per file, followed by `Put Block List`,
-   * re-checks the generation (a write during the upload aborts this
-     attempt; the burned nonce is harmless),
-   * calls `FinalizeCacheEntryUpload`.
-   On success the overlay op retires and the backing file becomes clean cache.
+   `mkdir`, `chmod` of a directory, and `symlink` record a `Put` too;
+   `unlink` and `rmdir` record a `Remove`, if the view has something there
+   to hide: a whiteout for a file or symlink, a `drop` for a kept directory,
+   whichever the view shows when it commits.
+2. When the last writable handle is released, the path is scheduled for
+   commit after a **settle delay** (default 1 s). Anything that touches the
+   inode in that window (reopen, rename, chmod, utimens, unlink) is simply
+   folded in. This is what makes the ubiquitous *write-temp-then-rename*
+   pattern (Nix, Bazel, Cargo, editors) upload only the final name.
+3. **Commit** takes every due operation, up to 10,000 paths or 256 MiB, as
+   one batch, and makes it one layer (LAYERS.md §5):
+   * files over 8 MiB are hashed and uploaded as blobs, in parallel, unless
+     a readable scope has the blob already; a blob is finalized only if its
+     file did not change meanwhile;
+   * the layer image is sealed into a local file; a file that changed while
+     it was copied waits for the next batch, and the image is built again
+     without it;
+   * the layer is uploaded: `CreateCacheEntry`, `Put Blob` (≤ 16 MiB) or
+     8 MiB `Put Block`s four at a time and `Put Block List`, then
+     `FinalizeCacheEntryUpload`.
+   On success the batch's overlay ops retire, the sealed file becomes the
+   cache of the layer, and a committed large file's local copy becomes the
+   cache of its blob. Layers upload one at a time, so they stack in the
+   order they were sealed; what becomes due meanwhile makes the next batch.
 4. **Retries.** `5xx`, network errors, and `429` back off and retry
    indefinitely while mounted; a `429` pauses further creations (but not
-   downloads) until `Retry-After`.
-   An ambiguous `Create`/`Finalize` restarts with a new nonce. Permanent
-   errors are recorded and reported at unmount.
+   downloads) until `Retry-After`. An ambiguous `Create`/`Finalize` restarts
+   with a new nonce. Permanent errors are recorded and reported at unmount.
 5. `fsync` commits the file *now* and waits, even if it is still open for
-   writing; a write that races with the upload makes the attempt start over.
-   It is the explicit durability point.
-6. **Unmount drains.** Every pending op becomes due immediately, markers are
-   written for empty directories, and whiteouts are written last. Whiteouts
-   produced by `rename` wait for the corresponding `Put` so that a failed
-   upload cannot lose data. The daemon exits non-zero if anything failed.
+   writing. It is the explicit durability point, and makes a layer of its
+   own: programs that sync every file meet the rate limit.
+6. **Unmount drains.** Every pending op becomes due immediately, and empty
+   directories that exist only locally get a `keep` mark. A rename's
+   whiteout goes in the layer of its new name, or a later one, so that a
+   failed upload cannot lose data. The daemon exits non-zero if anything
+   failed.
 
 Opening a *remote* file for writing is copy-on-write. `O_TRUNC` starts empty;
 otherwise the whole file is fetched first. The same applies to `truncate`,
-`chmod`, and `utimens` on a remote file: the metadata lives in the version, so
-changing it means writing a new entry.
+`chmod`, and `utimens` on a remote file: a layer holds whole files, so
+changing one means writing it again.
 
 ## 6. Read path
 
-* `open` resolves a download URL (`GetCacheEntryDownloadURL` with the exact
-  key and version). URLs are cached until one minute before their `se=`
-  expiry; a `403` re-resolves once.
-* `read` maps the byte range onto 1 MiB chunks. Missing chunks are coalesced
-  into range GETs of up to 8 MiB and fetched concurrently (at most 16 in
-  flight globally). Concurrent readers share in-flight fetches. The bytes land
-  in the sparse backing file and are served with `pread`.
+* **Mounting** lists the volume and reads each layer's metadata with one
+  download URL and one ranged GET, sixteen layers at a time. Files of up to
+  1 KiB and symlink targets arrive with it.
+* `read` of other files maps the byte range onto 1 MiB chunks of the layer
+  or blob that holds them. Missing chunks are coalesced into range GETs of
+  up to 8 MiB and fetched concurrently (at most 16 in flight globally).
+  Concurrent readers share in-flight fetches. The bytes land in the entry's
+  sparse backing file and are served with `pread`. Download URLs are cached
+  until one minute before their `se=` expiry; a layer's first data read
+  reuses the URL its metadata was read with, and a `403` re-resolves once.
 * **Readahead** is tracked per handle. A sequential reader doubles its window
   from 2 MiB up to 64 MiB and prefetches that far ahead, which turns the
   ~250 ms first-byte latency into streaming throughput. The chunk the reader
   needs goes first, in a request of its own. The window is then topped up in
   whole 8 MiB ranges, since sliding it one read at a time would fetch a chunk
   per request. Random readers only fetch what they touch.
-* **Sibling prefetch.** The first read of a small remote file (≤ 1 MiB) starts
-  background fetches of the other small files in its directory, six at a
-  time. `cp -r`, `diff -r`, and `tar c` over a tree of small files then read
-  mostly local data instead of paying two round trips (URL, then bytes) per
-  file.
+* **Sibling prefetch.** The first read of a small remote file (≤ 1 MiB)
+  fetches the other small files of its directory. A layer holds them in path
+  order, so per layer they are one range, fetched in 8 MiB requests if it is
+  at most 32 MiB long, and file by file, six at a time, otherwise. `cp -r`,
+  `diff -r`, and `tar c` over a tree of small files then read local data.
 * `FOPEN_KEEP_CACHE` is set only if the inode's content has not changed since
   the previous open, so the kernel page cache stays warm for immutable data
   without ever serving stale bytes.
@@ -301,14 +318,14 @@ changing it means writing a new entry.
 |-----------|----------|
 | `lookup`, `getattr`, `readdir(plus)` | In memory. A miss triggers at most one incremental refresh per `--refresh` interval (default 15 s), so polling for a file another job is writing works. The refresh runs in the background, and a lookup waits for it at most 2 s. |
 | `readdir` | Served from a snapshot taken at `opendir`/rewind, so `rm -r` does not skip entries. |
-| `mkdir` / `rmdir` | Local directory. A marker is written at unmount only if it is still empty; `rmdir` whites out an existing marker. `ENOTEMPTY` as usual. |
-| `unlink` | Drops a pending upload. If a remote entry is visible, whites it out. Open handles keep working (unlinked-but-open). |
-| `rename` | Free if the source's content is local (pending, or cached in full): the target gets a `Put`, the source a whiteout that waits for it. Directories rename if their subtree is purely local. Otherwise `EXDEV`, so `mv` falls back to copy + unlink. `RENAME_NOREPLACE` is honored; `RENAME_EXCHANGE` is `EINVAL`. |
-| `symlink` / `readlink` | Supported; the target is the blob, cached after the first read. |
-| `chmod`, `utimens` | Stored in the version (copy-on-write for remote files). `chown` is accepted and ignored; ownership is always the mounting user. |
+| `mkdir` / `rmdir` | `mkdir` commits a `keep` mark, so the directory exists even when empty. `rmdir` commits a `drop` if a layer keeps the directory, which then exists only while something below it does. `ENOTEMPTY` as usual. |
+| `unlink` | Drops a pending upload. If the view shows a file there, whites it out. Open handles keep working (unlinked-but-open). |
+| `rename` | Free if the source's content is local (pending, cached in full, or inline in the metadata) or it is a symlink: the target gets a `Put`, the source a whiteout in the same layer or a later one. Directories rename if nothing below them is in the view. Otherwise `EXDEV`, so `mv` falls back to copy + unlink. `RENAME_NOREPLACE` is honored; `RENAME_EXCHANGE` is `EINVAL`. |
+| `symlink` / `readlink` | Supported; the target lives in the layer's metadata. |
+| `chmod`, `utimens` | Committed: files are written again (copy-on-write for remote files), directories get an `attrs` mark, symlinks are written again. `chown` is accepted and ignored; ownership is always the mounting user. |
 | `link`, `mknod` (non-regular) | `EPERM`. |
 | xattrs | `ENOSYS`, so the kernel stops asking (and skips its per-write `security.capability` check); programs see `EOPNOTSUPP`. |
-| `statfs` | Capacity is the repository cache quota; "used" is the sum of listed entries. |
+| `statfs` | Capacity is the repository cache quota; "used" is the size of the visible files. |
 
 ## 8. Deployment
 
@@ -317,11 +334,12 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 `GITHUB_REPOSITORY`, `GITHUB_REF`, `GITHUB_BASE_REF`, `GITHUB_API_URL`, and
 `GITHUB_EVENT_PATH` (for the default branch).
 
-* `mount <dir> [--daemon]` lists the cache, mounts, and runs. With `--daemon`
-  it forks *before* starting any threads, and the parent exits `0` only once
-  the mount is live, so `gha-cache-fusefs mount … --daemon && ls <dir>` is
-  race-free. State (log, lock, `summary.json`, cached data) lives under
-  `--state-dir`, which defaults to a directory derived from the mountpoint.
+* `mount <dir> [--daemon] [--volume V] [--root R]` lists the cache, mounts,
+  and runs. With `--daemon` it forks *before* starting any threads, and the
+  parent exits `0` only once the mount is live, so
+  `gha-cache-fusefs mount … --daemon && ls <dir>` is race-free. State (log,
+  lock, `summary.json`, cached data) lives under `--state-dir`, which
+  defaults to a directory derived from the mountpoint.
 * `unmount <dir>` sends `SIGTERM`. The daemon unmounts (lazily if the mount is
   busy), drains uploads, and writes `summary.json`. `unmount` blocks on the
   daemon's lock file until then, prints the summary, and exits non-zero if
@@ -329,13 +347,14 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 * `ACTIONS_CACHE_MODE=read` mounts read-only; `none` refuses to mount.
 * Runner tokens are only visible to actions, not to `run:` steps. The
   `mount/` action (a dependency-free `node24` action) passes them to the
-  daemon in `main` and unmounts in `post`, which also writes a job summary. It finds the binary in the
-  `binary` input, the release for its ref (published by `fusefs-release`),
-  or builds it from its own checkout with Nix or with the runner's cargo:
+  daemon in `main` and unmounts in `post`, which also writes a job summary.
+  It finds the binary in the `binary` input, the release for its ref
+  (published by `fusefs-release`), or builds it from its own checkout with
+  Nix or with the runner's cargo:
 
   ```yaml
   permissions:
-    actions: write   # read suffices; write enables garbage collection
+    actions: read
     contents: read
   steps:
     - uses: philiptaron/gha-cache-fusefs/mount@main
@@ -346,8 +365,12 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 
 ## 9. Testing
 
-* **Unit tests** cover the version codec, key/path mapping, scope merging,
+* **Unit tests** cover the version codec, keys and volumes, layer stacking
+  (whiteouts, marks, attributes, missing blobs), EROFS writing and reading,
   error classification, and the parsing of listings and SAS expiries.
+* **erofs-utils** checks the EROFS code: `fsck.erofs` must accept and
+  extract what we write, and we must read what `mkfs.erofs` writes. The
+  integration tests also run `fsck.erofs` on layers the filesystem wrote.
 * **A fake cache service** (`gha-cache-fusefs fake-server`) implements the
   three Twirp methods, SAS-style blob endpoints (Put Blob/Block/BlockList,
   ranged GET/HEAD, expiring URLs, injectable 503s), and the REST list/delete
@@ -358,10 +381,13 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
   the benchmarks in [PERFORMANCE.md](PERFORMANCE.md) rely on.
 * **Integration tests** drive the `Vfs` core against the fake service, one
   "job" after another. They cover persistence, overwrite, copy-on-write,
-  whiteouts across branch scopes, the three kinds of rename (pending, cached,
-  `EXDEV`), directory markers, symlinks, empty files, metadata, block
-  uploads, ranged reads, injected failures, `fsync`, refresh on lookup miss,
-  `readdir` snapshots, unlinked-but-open files, and sibling prefetch.
+  whiteouts across branch scopes and between concurrent jobs, the kinds of
+  rename (pending, cached, inline, symlink, `EXDEV`), directory marks and
+  attributes, symlinks, empty files, metadata, one layer per batch, blobs
+  and their deduplication and loss, block uploads, ranged reads, injected
+  failures, rate limits, `fsync`, refresh on lookup miss, volumes, mounting
+  a directory of the volume, `readdir` snapshots, unlinked-but-open files,
+  and sibling prefetch.
 * **[`tests/e2e.sh`](tests/e2e.sh)** runs real tools through the kernel in
   three phases, each a fresh mount: write (coreutils, `cp -a`, `tar -x`,
   `rsync`, `dd`, `mksquashfs`, exec, write-then-rename), read and modify
@@ -370,13 +396,16 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
   and verify and remove. CI runs it three ways: in a NixOS VM against the
   fake service (`nix flake check`), on a runner as the unprivileged user
   against the fake service, and across three dependent jobs against the real
-  cache. A final job deletes what the run created.
+  cache, in a volume of the run's own. A final job deletes the volume.
 
 ## 10. Future work
 
-* Packing small files into shared entries, to get past the ~200 creations
-  per 40–50 s that the service allows (see PERFORMANCE.md). The proposed
-  format is [LAYERS.md](LAYERS.md): EROFS images stacked like overlayfs.
+* Snapshots (LAYERS.md §8): a layer holding the merged tree of its scope,
+  so that the layers it covers can expire, and with them garbage collection.
+* Moving remote files and directories as metadata, once snapshots can refer
+  to data in other layers.
+* Skipping unchanged uploads: `cp -a`, `tar -x`, and `rsync` of mostly
+  unchanged trees rewrite every file.
 * Lazy copy-on-write: opening a remote file read-write downloads it at once,
   even if nothing is written.
 * A read-only view of foreign entries (for example `actions/cache` archives).

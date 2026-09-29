@@ -11,12 +11,12 @@ use anyhow::{Context, bail, ensure};
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::api::{Api, CacheItem, Requests};
+use crate::api::{Api, Requests};
 use crate::config::Env;
 use crate::data::DataStore;
-use crate::entry::{KeySpace, Kind, Meta};
+use crate::entry::{Kind, Volume};
 use crate::fake::{FakeConfig, FakeServer};
-use crate::index::{self, Index};
+use crate::index::{self, Index, Layer, Listed};
 use crate::vfs::{Attr, DirEntry, FileKind, Ino, ROOT, Summary, Vfs, VfsConfig};
 
 const MAIN: &str = "refs/heads/main";
@@ -29,8 +29,8 @@ pub const SCENARIOS: [&str; 4] = ["large", "small", "mount", "throttled"];
 pub enum Service {
     /// A fresh fake service for each scenario.
     Fake(FakeConfig),
-    /// The cache of the current Actions job, below `prefix`.
-    Real { env: Env, prefix: String },
+    /// The cache of the current Actions job, in volumes named `<volume>-<scenario>`.
+    Real { env: Env, volume: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -43,9 +43,10 @@ pub struct Sizes {
     pub files: usize,
     pub file_size: usize,
     pub dirs: usize,
-    /// Entries a mount lists (the fake service only).
+    /// Files in the volume that `mount` mounts, in layers of `LAYER_FILES`
+    /// (the fake service only).
     pub entries: usize,
-    /// Files written at once to run into the rate limit.
+    /// Files written and fsynced one at a time, to run into the rate limit.
     pub burst: usize,
 }
 
@@ -78,13 +79,14 @@ impl Sizes {
     pub fn describe(&self) -> String {
         format!(
             "A {} MiB file and {} random reads of it; {} files of {} in {} directories; \
-             {} listed entries; a burst of {} files",
+             {} files in layers of {}; a burst of {} fsynced files",
             self.large_mib,
             self.random_reads,
             self.files,
             size(self.file_size as u64),
             self.dirs,
             self.entries,
+            LAYER_FILES,
             self.burst
         )
     }
@@ -137,17 +139,19 @@ pub async fn run(service: &Service, sizes: &Sizes, only: &[String]) -> anyhow::R
     }
     .await;
     let _ = std::fs::remove_dir_all(&scratch);
-    if let Service::Real { env, prefix } = service {
-        cleanup(env, prefix).await;
+    if let Service::Real { env, volume } = service {
+        for name in SCENARIOS {
+            cleanup(env, &format!("{volume}-{name}")).await;
+        }
     }
     result.map(|()| rows)
 }
 
-/// Where one scenario's jobs mount: a fresh fake service, or a fresh prefix
+/// Where one scenario's jobs mount: a fresh fake service, or a fresh volume
 /// of the real cache.
 struct Cache {
     env: Env,
-    prefix: String,
+    volume: String,
     fake: Option<FakeServer>,
     /// Whether creating entries is rate limited.
     limited: bool,
@@ -160,24 +164,24 @@ type Parts = (VfsConfig, Api, Arc<DataStore>);
 
 impl Cache {
     async fn new(service: &Service, scenario: &str, scratch: PathBuf) -> anyhow::Result<Cache> {
-        let (env, prefix, fake, limited) = match service {
+        let (env, volume, fake, limited) = match service {
             Service::Fake(cfg) => {
                 let fake = FakeServer::start(cfg.clone()).await?;
                 let env = fake.env(MAIN, &[]);
                 (
                     env,
-                    "fusefs/".into(),
+                    "default".into(),
                     Some(fake),
                     cfg.create_limit.is_some(),
                 )
             }
-            Service::Real { env, prefix } => {
-                (env.clone(), format!("{prefix}{scenario}/"), None, true)
+            Service::Real { env, volume } => {
+                (env.clone(), format!("{volume}-{scenario}"), None, true)
             }
         };
         Ok(Cache {
             env,
-            prefix,
+            volume,
             fake,
             limited,
             scratch,
@@ -202,7 +206,7 @@ impl Cache {
     fn parts(&mut self) -> anyhow::Result<Parts> {
         self.jobs += 1;
         let store = DataStore::new(&self.scratch.join(format!("job{}", self.jobs)), 8 << 30, 16)?;
-        let mut cfg = VfsConfig::new(KeySpace::new(&self.prefix));
+        let mut cfg = VfsConfig::new(Volume::new(&self.volume).map_err(anyhow::Error::msg)?);
         cfg.settle = Duration::from_secs(3600);
         Ok((cfg, Api::new(&self.env)?, store))
     }
@@ -378,7 +382,7 @@ async fn small(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::R
     let m = Meter::start(Summary::default());
     let b = cache.load(parts).await?;
     let l = m.stop(&b.summary());
-    out.push(&l, format!("mount, listing {n} entries"), "");
+    out.push(&l, format!("mount, stacking {n} files"), "");
     let m = Meter::start(b.summary());
     let files = read_tree(&b, lookup(&b, "small").await?.ino).await?;
     ensure!(files == n, "read {files} of {n} files");
@@ -415,17 +419,40 @@ async fn small(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::R
     Ok(())
 }
 
-/// Mounting a cache with many entries, and the CPU cost of building its tree.
+/// Files per layer in the volume `mount` mounts: about what one batch of
+/// `cp -r` makes.
+const LAYER_FILES: usize = 1_000;
+
+/// Layers holding `n` one-byte files, as `(image, version)`.
+fn layers_of(n: usize) -> anyhow::Result<Vec<(Vec<u8>, crate::entry::Version)>> {
+    (0..n.div_ceil(LAYER_FILES))
+        .map(|l| {
+            let files: Vec<(String, Vec<u8>)> = (l * LAYER_FILES..n.min((l + 1) * LAYER_FILES))
+                .map(|i| (entry_path(i), b"x".to_vec()))
+                .collect();
+            Ok(index::layer_image(&files)?)
+        })
+        .collect()
+}
+
+/// Mounting a volume of many files in many layers, and the CPU cost of
+/// stacking them.
 async fn mount(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::Result<()> {
     let n = sizes.entries;
     let Some(fake) = &cache.fake else {
         eprintln!("bench: mount: skipped; it needs the fake service to create entries quickly");
         return Ok(());
     };
-    for i in 0..n {
-        let meta = Meta::new(Kind::File, 0o644, SystemTime::now());
-        let key = format!("{}{}", cache.prefix, entry_path(i));
-        fake.insert(&key, &meta.encode(), MAIN, Bytes::from_static(b"x"));
+    let volume = Volume::new(&cache.volume).map_err(anyhow::Error::msg)?;
+    let layers = layers_of(n)?;
+    let count = layers.len();
+    for (image, version) in layers {
+        fake.insert(
+            &volume.layer_key(version.nonce),
+            &version.encode(),
+            MAIN,
+            Bytes::from(image),
+        );
     }
     let parts = cache.parts()?;
     let m = Meter::start(Summary::default());
@@ -433,47 +460,74 @@ async fn mount(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::R
     let l = m.stop(&a.summary());
     out.push(
         &l,
-        format!("list {n} entries and build the tree"),
-        per_sec(n, l.elapsed, "entries"),
+        format!("list {count} layers, read their metadata, and build the tree of {n} files"),
+        per_sec(n, l.elapsed, "files"),
     );
 
     // The same, ten times larger, from memory: the CPU cost alone.
     let big = n * 10;
-    let now = humantime::format_rfc3339_micros(SystemTime::now()).to_string();
-    let items: Vec<CacheItem> = (0..big)
-        .map(|i| CacheItem {
-            id: i as i64 + 1,
-            git_ref: MAIN.into(),
-            key: format!("{}{}", cache.prefix, entry_path(i)),
-            version: Meta::new(Kind::File, 0o644, SystemTime::now()).encode(),
-            size_in_bytes: 1,
-            created_at: now.clone(),
-            last_accessed_at: now.clone(),
+    let parsed: Vec<Layer> = layers_of(big)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, (image, version))| {
+            let Kind::Layer { meta_blocks } = version.kind else {
+                unreachable!("a layer")
+            };
+            let now = SystemTime::now();
+            let entry = Listed {
+                key: volume.layer_key(version.nonce),
+                version: version.encode(),
+                size: image.len() as u64,
+                created: now,
+                accessed: now,
+                id: i as i64 + 1,
+                scope: 0,
+            };
+            Ok(Layer::parse(entry, meta_blocks, &image)?)
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     let (cfg, api, store) = cache.parts()?;
     let t = Instant::now();
-    let mut ix = Index::new(vec![MAIN.into()]);
-    for item in &items {
-        let e = ix.entry_from_item(item).context("our own entry")?;
-        ix.insert(e);
+    let mut ix = Index::new(volume.clone(), vec![MAIN.into()]);
+    for layer in parsed {
+        ix.insert_layer(layer);
     }
+    ix.restack();
     let vfs = Vfs::with_index(cfg, api, store, ix);
     let elapsed = t.elapsed();
     ensure!(!list(&vfs, ROOT)?.is_empty(), "the tree is empty");
     out.push(
         &Measured::time(elapsed),
-        format!("build the tree for {big} listed entries (CPU only)"),
         format!(
-            "{:.1} µs per entry",
+            "stack {big} files in {} layers and build the tree (CPU only)",
+            big.div_ceil(LAYER_FILES)
+        ),
+        format!(
+            "{:.1} µs per file",
             elapsed.as_secs_f64() * 1e6 / big as f64
         ),
     );
     Ok(())
 }
 
-/// A burst of writes runs into the rate limit; meanwhile, a job reads a
-/// file it does not have yet, and so does another job.
+/// Jobs that write and fsync files at once in `throttled`.
+const WRITERS: usize = 6;
+
+/// Writes and fsyncs `n` files one at a time, each a layer of its own.
+async fn write_synced(job: Vfs, dir: Ino, first: usize, n: usize) -> anyhow::Result<()> {
+    for i in first..first + n {
+        let name = format!("f{i:04}");
+        let (_, fh) = job.create(dir, &name, 0o644, libc::O_WRONLY | libc::O_CREAT)?;
+        job.write(fh, 0, &noise(64, i as u64))?;
+        job.fsync(fh).await?;
+        job.release(fh)?;
+    }
+    Ok(())
+}
+
+/// Files written and fsynced one at a time make a layer each. Several jobs
+/// doing that at once run into the rate limit; meanwhile, one of them reads
+/// a file it does not have yet, and so does another job.
 async fn throttled(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::Result<()> {
     if !cache.limited {
         eprintln!("bench: throttled: skipped; this service has no rate limit");
@@ -481,39 +535,58 @@ async fn throttled(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyho
     }
     let a = cache.job().await?;
     write_file(&a, ROOT, "target", 4096, 3)?;
+    a.mkdir(ROOT, "burst", 0o755)?;
     drained(&a).await?;
 
-    let writer = cache.job_with(|c| c.settle = Duration::ZERO).await?;
+    let mut writers = Vec::new();
+    for _ in 0..WRITERS {
+        writers.push(cache.job_with(|c| c.settle = Duration::ZERO).await?);
+    }
     let other = cache.job().await?;
     let mut handles = Vec::new();
-    for job in [&writer, &other] {
+    for job in [&writers[0], &other] {
         let ino = lookup(job, "target").await?.ino;
         handles.push(job.open(ino, libc::O_RDONLY).await?.0);
     }
-    let m = Meter::start(writer.summary());
-    let dir = writer.mkdir(ROOT, "burst", 0o755)?.ino;
-    for i in 0..sizes.burst {
-        write_file(&writer, dir, &format!("f{i:04}"), 64, i as u64)?;
+    let summaries = |writers: &[Vfs]| writers.iter().map(Vfs::summary).collect::<Vec<_>>();
+    let limited = |writers: &[Vfs]| {
+        writers
+            .iter()
+            .map(|w| w.summary().rate_limited)
+            .sum::<u64>()
+    };
+    let m = Meter::start(writers[0].summary());
+    let per = sizes.burst.div_ceil(WRITERS);
+    let mut writing = Vec::new();
+    for (n, w) in writers.iter().enumerate() {
+        let dir = lookup(w, "burst").await?.ino;
+        writing.push(tokio::spawn(write_synced(w.clone(), dir, n * per, per)));
     }
     let deadline = Instant::now() + Duration::from_secs(180);
-    while writer.summary().rate_limited == 0 {
-        if Instant::now() > deadline {
-            let w = m.stop(&writer.summary());
+    while limited(&writers) == 0 {
+        if Instant::now() > deadline || writing.iter().all(|t| t.is_finished()) {
+            let w = m.stop(&writers[0].summary());
             out.push(
                 &w,
-                format!("write {} files", sizes.burst),
+                format!("write and fsync {} files in {WRITERS} jobs", per * WRITERS),
                 "never rate limited",
             );
-            drained(&writer).await?;
+            for t in writing {
+                t.await??;
+            }
+            for w in &writers {
+                drained(w).await?;
+            }
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let w = m.stop(&writer.summary());
+    let uploaded: u64 = summaries(&writers).iter().map(|s| s.layers).sum();
+    let w = m.stop(&writers[0].summary());
     out.push(
         &w,
-        format!("write {} files until the first 429", sizes.burst),
-        format!("{} uploaded", writer.summary().uploaded_files),
+        format!("write and fsync files in {WRITERS} jobs until the first 429"),
+        format!("{uploaded} layers"),
     );
 
     let timed = |job: &Vfs, fh: u64| {
@@ -528,20 +601,30 @@ async fn throttled(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyho
     // The other job does nothing else, so its counters are the read's; the
     // writer's also count its uploads.
     let m = Meter::start(other.summary());
-    let (same, elsewhere) = tokio::join!(timed(&writer, handles[0]), timed(&other, handles[1]));
-    out.push(&Measured::time(same?), "a cold 4 KiB read in that job", "");
+    let (same, elsewhere) = tokio::join!(timed(&writers[0], handles[0]), timed(&other, handles[1]));
+    out.push(
+        &Measured::time(same?),
+        "a cold 4 KiB read in one of them",
+        "",
+    );
     let r = Measured {
         elapsed: elsewhere?,
         ..m.stop(&other.summary())
     };
     out.push(&r, "the same read in another job", "");
 
-    let m = Meter::start(writer.summary());
-    let d = m.stop(&drained(&writer).await?);
+    let m = Meter::start(writers[0].summary());
+    for t in writing {
+        t.await??;
+    }
+    for w in &writers[1..] {
+        drained(w).await?;
+    }
+    let d = m.stop(&drained(&writers[0]).await?);
     out.push(
         &d,
-        "upload the rest (unmount)",
-        format!("{} files in all", sizes.burst),
+        "write and fsync the rest, and unmount",
+        format!("{} files in all", per * WRITERS),
     );
     Ok(())
 }
@@ -550,10 +633,11 @@ async fn throttled(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyho
 /// small entries: each deletion is a REST request, and the repository's
 /// `GITHUB_TOKEN` budget (1,000 an hour) is worth more than a few MB of
 /// quota that eviction frees within a week.
-async fn cleanup(env: &Env, prefix: &str) {
+async fn cleanup(env: &Env, volume: &str) {
+    let prefix = format!("gha-fs/{volume}/");
     let result = async {
         let api = Api::new(env)?;
-        let items = index::list_all(&api.rest, prefix, std::slice::from_ref(&env.git_ref)).await?;
+        let items = index::list_all(&api.rest, &prefix, std::slice::from_ref(&env.git_ref)).await?;
         let mut deleted = 0;
         for item in items.iter().filter(|i| i.size_in_bytes >= 1 << 20) {
             api.rest.delete(item.id).await?;

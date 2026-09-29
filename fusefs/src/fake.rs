@@ -319,6 +319,19 @@ impl FakeServer {
             .collect()
     }
 
+    /// The content of the newest finalized entry with this key in `scope`.
+    pub fn data(&self, key: &str, scope: &str) -> Option<Bytes> {
+        let id = self
+            .inner
+            .entries
+            .lock()
+            .iter()
+            .filter(|e| e.finalized && e.key == key && e.scope == scope)
+            .max_by_key(|e| (e.created, e.id))?
+            .id;
+        self.inner.blobs.lock().get(&id)?.committed.clone()
+    }
+
     pub fn blob_requests(&self) -> u64 {
         self.inner.blob_requests.load(Ordering::Relaxed)
     }

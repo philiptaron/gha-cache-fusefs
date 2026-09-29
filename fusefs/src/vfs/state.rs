@@ -4,31 +4,36 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use super::{
-    Attr, DirEntry, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOTDIR, ENOTEMPTY, EXDEV, Errno,
-    FileKind, Ino, ROOT, RenameMode, Result, VfsConfig, io_err,
+    Attr, DirEntry, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EXDEV, Errno, FileKind,
+    Ino, ROOT, RenameMode, Result, VfsConfig, io_err,
 };
-use crate::data::{DataFile, DataStore, RemoteData};
-use crate::entry::{KeyPath, Kind, MAX_KEY_LEN, join, split, valid_component};
-use crate::index::{Index, RemoteEntry};
+use crate::data::{DataFile, DataStore, RemoteData, RemoteFile};
+use crate::entry::{Mark, join, split, valid_component};
+use crate::index::{FileRef, Index, Listed, Node as ViewNode, NodeId, Where};
 
 #[derive(Clone, Debug)]
 pub(super) enum Content {
     /// Authoritative local data (pending, or not yet evictable).
     Local(Arc<DataFile>),
-    /// A remote entry and its local cache.
-    Remote(Arc<RemoteData>),
+    /// A file of the view, and its local cache.
+    Remote(Arc<RemoteFile>),
 }
 
 #[derive(Debug)]
 pub(super) struct Dir {
     pub children: BTreeMap<String, Ino>,
-    /// The visible remote marker entry, if any.
-    pub marker: Option<RemoteEntry>,
-    /// Exists even without children or a marker (created or emptied locally).
+    /// The view keeps it: exists even when empty.
+    pub kept: bool,
+    /// Exists even without children (created or emptied locally).
     pub pinned: bool,
+    /// A mark to commit: `keep` after `mkdir`, `attrs` after `chmod`.
+    pub mark: Option<Mark>,
+    /// Bumped by every change to the mark or attributes; a commit retires
+    /// the mark only if it did not move.
+    pub generation: u64,
     pub mode: u16,
     pub mtime: SystemTime,
 }
@@ -45,14 +50,15 @@ pub(super) struct File {
     /// Bumped by every change; a commit is valid only if it did not move.
     pub generation: u64,
     pub dirty: bool,
-    /// The entry that holds this local content, once committed.
-    pub committed: Option<RemoteEntry>,
+    /// The file of the view that holds this local content, once committed.
+    pub committed: Option<Arc<RemoteFile>>,
 }
 
 #[derive(Debug)]
 pub(super) struct Symlink {
-    pub target: Option<String>,
-    pub remote: Option<Arc<RemoteData>>,
+    pub target: String,
+    /// The node of the view it came from, or was committed as.
+    pub id: Option<NodeId>,
     pub mtime: SystemTime,
     pub dirty: bool,
     pub generation: u64,
@@ -91,10 +97,13 @@ pub(super) struct Handle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PendingOp {
-    /// Upload the node currently at this key.
+    /// Commit the node now at this path: a file, a symlink, or a
+    /// directory's mark.
     Put(Ino),
-    /// Hide this key with a whiteout, once `after` has no pending `Put`.
-    Delete { after: Option<String> },
+    /// Hide what the view shows here: a file or symlink with a whiteout, a
+    /// kept directory with a `drop` mark. A rename's whiteout waits while
+    /// the renamed inode, `after`, has a `Put` pending wherever it is now.
+    Remove { after: Option<Ino> },
 }
 
 #[derive(Debug)]
@@ -114,9 +123,7 @@ pub(super) struct Pending {
 
 pub(super) enum RenameNeeds {
     /// The source's remote content must be made local first.
-    Copy(Ino, Arc<RemoteData>),
-    /// The source symlink's target must be fetched first.
-    Target(Ino),
+    Copy(Ino, Arc<RemoteFile>),
 }
 
 pub(super) struct State {
@@ -127,6 +134,7 @@ pub(super) struct State {
     next_fh: u64,
     next_op: u64,
     pub index: Index,
+    /// Pending operations by path below the mount root.
     pub overlay: BTreeMap<String, Pending>,
     /// Overlay ops by due time, earliest first, so that the committer looks
     /// only at what is due. An entry lapses when its op is rescheduled,
@@ -135,6 +143,8 @@ pub(super) struct State {
     pub last_refresh: Instant,
     /// Directories whose small files were already prefetched.
     pub prefetched_dirs: HashSet<Ino>,
+    /// The caches of the layers and blobs files are read from, by entry id.
+    entries: HashMap<i64, Arc<RemoteData>>,
 }
 
 impl State {
@@ -151,8 +161,10 @@ impl State {
                 last_open_epoch: None,
                 body: Body::Dir(Dir {
                     children: BTreeMap::new(),
-                    marker: None,
+                    kept: false,
                     pinned: true,
+                    mark: None,
+                    generation: 0,
                     mode: 0o755,
                     mtime: SystemTime::now(),
                 }),
@@ -170,6 +182,7 @@ impl State {
             queue: BinaryHeap::new(),
             last_refresh: Instant::now(),
             prefetched_dirs: HashSet::new(),
+            entries: HashMap::new(),
         }
     }
 
@@ -179,7 +192,7 @@ impl State {
         dir: Ino,
         max_size: u64,
         limit: usize,
-    ) -> Vec<Arc<RemoteData>> {
+    ) -> Vec<Arc<RemoteFile>> {
         let Ok(d) = self.dir(dir) else {
             return Vec::new();
         };
@@ -187,13 +200,41 @@ impl State {
             .values()
             .filter_map(|c| match self.nodes.get(c).map(|n| &n.body) {
                 Some(Body::File(File {
-                    content: Content::Remote(rd),
+                    content: Content::Remote(rf),
                     ..
-                })) if (1..=max_size).contains(&rd.size()) => Some(rd.clone()),
+                })) if (1..=max_size).contains(&rf.size()) && rf.range_of().is_some() => {
+                    Some(rf.clone())
+                }
                 _ => None,
             })
             .take(limit)
             .collect()
+    }
+
+    /// The cache of a layer or blob.
+    pub fn entry_data(&mut self, store: &Arc<DataStore>, entry: &Listed) -> Arc<RemoteData> {
+        self.entries
+            .entry(entry.id)
+            .or_insert_with(|| RemoteData::new(store, entry.clone()))
+            .clone()
+    }
+
+    /// The content of a file of the view.
+    pub fn remote_file(&mut self, store: &Arc<DataStore>, f: &FileRef) -> Arc<RemoteFile> {
+        match &f.data {
+            Where::Inline(bytes) => RemoteFile::inline(f.id, bytes.clone()),
+            Where::Layer { layer, offset } => {
+                let rd = self.entry_data(store, &layer.entry);
+                if let Some(url) = &layer.url {
+                    rd.seed_url(url);
+                }
+                RemoteFile::range(f.id, rd, *offset, f.size)
+            }
+            Where::Blob { blob, offset } => {
+                let rd = self.entry_data(store, blob);
+                RemoteFile::range(f.id, rd, *offset, f.size)
+            }
+        }
     }
 
     // ---- accessors --------------------------------------------------------
@@ -213,7 +254,7 @@ impl State {
         }
     }
 
-    fn dir_mut(&mut self, ino: Ino) -> Result<&mut Dir> {
+    pub fn dir_mut(&mut self, ino: Ino) -> Result<&mut Dir> {
         match &mut self.node_mut(ino)?.body {
             Body::Dir(d) => Ok(d),
             _ => Err(ENOTDIR),
@@ -254,7 +295,7 @@ impl State {
         parts.join("/")
     }
 
-    fn resolve(&self, path: &str) -> Option<Ino> {
+    pub fn resolve(&self, path: &str) -> Option<Ino> {
         let mut ino = ROOT;
         if path.is_empty() {
             return Some(ino);
@@ -305,18 +346,11 @@ impl State {
             Body::File(f) => {
                 let size = match &f.content {
                     Content::Local(_) => f.size,
-                    Content::Remote(rd) => rd.size(),
+                    Content::Remote(rf) => rf.size(),
                 };
                 (FileKind::File, size, f.mtime, f.mode, 1)
             }
-            Body::Symlink(s) => {
-                let size = match (&s.target, &s.remote) {
-                    (Some(t), _) => t.len() as u64,
-                    (None, Some(rd)) => rd.size(),
-                    (None, None) => 0,
-                };
-                (FileKind::Symlink, size, s.mtime, 0o777, 1)
-            }
+            Body::Symlink(s) => (FileKind::Symlink, s.target.len() as u64, s.mtime, 0o777, 1),
         };
         Attr {
             ino,
@@ -366,7 +400,17 @@ impl State {
         fh
     }
 
+    /// Adds a node, as a local operation: the parent's mtime moves.
     pub fn alloc(&mut self, parent: Ino, name: &str, body: Body) -> Ino {
+        let ino = self.alloc_remote(parent, name, body);
+        if let Ok(d) = self.dir_mut(parent) {
+            d.mtime = SystemTime::now();
+        }
+        ino
+    }
+
+    /// Adds a node the view has: the parent keeps the view's mtime.
+    fn alloc_remote(&mut self, parent: Ino, name: &str, body: Body) -> Ino {
         let ino = self.next_ino;
         self.next_ino += 1;
         self.nodes.insert(
@@ -383,14 +427,23 @@ impl State {
         );
         if let Ok(d) = self.dir_mut(parent) {
             d.children.insert(name.to_string(), ino);
-            d.mtime = SystemTime::now();
         }
         ino
     }
 
-    /// Unlinks a node (and, for directories, everything below it). Open
-    /// nodes stay alive until their last handle is released.
+    /// Unlinks a node (and, for directories, everything below it), as a
+    /// local operation: the parent's mtime moves. Open nodes stay alive
+    /// until their last handle is released.
     pub fn detach(&mut self, ino: Ino) {
+        let parent = self.nodes.get(&ino).map(|n| n.parent);
+        self.detach_remote(ino);
+        if let Some(Ok(d)) = parent.map(|p| self.dir_mut(p)) {
+            d.mtime = SystemTime::now();
+        }
+    }
+
+    /// Unlinks a node the view no longer has.
+    fn detach_remote(&mut self, ino: Ino) {
         let Some(node) = self.nodes.get_mut(&ino) else {
             return;
         };
@@ -403,11 +456,10 @@ impl State {
         if let Ok(d) = self.dir_mut(parent) {
             if d.children.get(&name) == Some(&ino) {
                 d.children.remove(&name);
-                d.mtime = SystemTime::now();
             }
         }
         for c in children {
-            self.detach(c);
+            self.detach_remote(c);
         }
         if self.nodes.get(&ino).is_some_and(|n| n.open == 0) {
             self.nodes.remove(&ino);
@@ -454,8 +506,10 @@ impl State {
             };
             let parent = node.parent;
             match &node.body {
-                Body::Dir(d) if !d.pinned && d.marker.is_none() && d.children.is_empty() => {
-                    self.detach(ino);
+                Body::Dir(d)
+                    if !d.pinned && !d.kept && d.mark.is_none() && d.children.is_empty() =>
+                {
+                    self.detach_remote(ino);
                     ino = parent;
                 }
                 _ => return,
@@ -465,12 +519,12 @@ impl State {
 
     // ---- the overlay ------------------------------------------------------
 
-    pub fn set_op(&mut self, key: &str, op: PendingOp, due: Option<Instant>) {
+    pub fn set_op(&mut self, path: &str, op: PendingOp, due: Option<Instant>) {
         let op_id = self.next_op;
         self.next_op += 1;
         let p = self
             .overlay
-            .entry(key.to_string())
+            .entry(path.to_string())
             .or_insert_with(|| Pending {
                 op: op.clone(),
                 op_id,
@@ -489,31 +543,31 @@ impl State {
         p.attempts = 0;
         p.error = None;
         p.failed = false;
-        self.schedule(key, due);
+        self.schedule(path, due);
     }
 
-    /// Sets when the op at `key` becomes eligible, and queues it for then.
-    pub fn schedule(&mut self, key: &str, due: Option<Instant>) {
-        let Some(p) = self.overlay.get_mut(key) else {
+    /// Sets when the op at `path` becomes eligible, and queues it for then.
+    pub fn schedule(&mut self, path: &str, due: Option<Instant>) {
+        let Some(p) = self.overlay.get_mut(path) else {
             return;
         };
         p.due = due;
         if let Some(t) = due {
-            self.queue.push(Reverse((t, key.to_string())));
+            self.queue.push(Reverse((t, path.to_string())));
         }
     }
 
     /// Whether a queue entry still stands for an op waiting to be attempted.
-    pub fn queued(&self, key: &str, due: Instant) -> bool {
+    pub fn queued(&self, path: &str, due: Instant) -> bool {
         self.overlay
-            .get(key)
+            .get(path)
             .is_some_and(|p| p.due == Some(due) && p.inflight.is_none() && !p.failed)
     }
 
     /// When the next queued op becomes eligible. Drops lapsed entries.
     pub fn next_due(&mut self) -> Option<Instant> {
-        while let Some(Reverse((due, key))) = self.queue.peek() {
-            if self.queued(key, *due) {
+        while let Some(Reverse((due, path))) = self.queue.peek() {
+            if self.queued(path, *due) {
                 return Some(*due);
             }
             self.queue.pop();
@@ -522,88 +576,124 @@ impl State {
     }
 
     /// Drops an op that turned out to be unnecessary.
-    pub fn clear_op(&mut self, key: &str) {
-        if self.overlay.get(key).is_some_and(|p| p.inflight.is_none()) {
-            self.overlay.remove(key);
+    pub fn clear_op(&mut self, path: &str) {
+        if self.overlay.get(path).is_some_and(|p| p.inflight.is_none()) {
+            self.overlay.remove(path);
         }
     }
 
-    /// The node at `key` went away locally: hide the remote entry, if there
-    /// is (or may soon be) one.
-    pub fn retire_key(&mut self, key: &str, after: Option<String>, due: Option<Instant>) {
-        let inflight = self.overlay.get(key).is_some_and(|p| p.inflight.is_some());
-        if inflight || self.index.visible(key).is_some() {
-            self.set_op(key, PendingOp::Delete { after }, due);
+    fn inflight(&self, path: &str) -> bool {
+        self.overlay.get(path).is_some_and(|p| p.inflight.is_some())
+    }
+
+    /// The node at `path` went away locally: hide what the view shows there,
+    /// if anything (or soon, if an upload is under way). Whatever went away,
+    /// the view may show something else there, such as the file a local
+    /// directory replaced.
+    pub fn retire(
+        &mut self,
+        cfg: &VfsConfig,
+        path: &str,
+        after: Option<Ino>,
+        due: Option<Instant>,
+    ) {
+        let full = cfg.full(path);
+        if self.inflight(path) || self.index.leaf_at(&full) || self.index.kept(&full) {
+            self.set_op(path, PendingOp::Remove { after }, due);
         } else {
-            self.overlay.remove(key);
+            self.overlay.remove(path);
         }
+    }
+
+    /// Whether ops are pending below `path`.
+    fn ops_below(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
+        self.overlay
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(&prefix))
     }
 
     // ---- merging the remote view -----------------------------------------
 
-    /// Makes the tree agree with the index for `key`, unless a local
-    /// operation on the key is pending.
-    pub fn apply_remote(&mut self, cfg: &VfsConfig, store: &Arc<DataStore>, key: &str) {
-        if self.overlay.contains_key(key) {
+    /// Makes the tree agree with the view at `path` (below the mount root),
+    /// unless a local operation there is pending.
+    pub fn apply_remote(&mut self, cfg: &VfsConfig, store: &Arc<DataStore>, path: &str) {
+        if self.overlay.contains_key(path) {
             return;
         }
-        let Some(kp) = cfg.keys.parse(key) else {
-            return;
-        };
-        let winner = self.index.visible(key).cloned();
-        match kp {
-            KeyPath::DirMarker(path) => match winner {
-                Some(e) if e.meta.kind == Kind::Dir => {
-                    if let Some(ino) = self.ensure_dir(store, &path) {
-                        if let Ok(d) = self.dir_mut(ino) {
-                            d.mode = e.meta.mode;
-                            d.mtime = e.meta.mtime;
-                            d.marker = Some(e);
-                        }
+        let node = self.index.get(&cfg.full(path)).cloned();
+        let (parent_path, name) = split(path);
+        match node {
+            Some(ViewNode::Dir { meta, keep }) => {
+                let ino = if path.is_empty() {
+                    ROOT
+                } else {
+                    match self.ensure_dir(path) {
+                        Some(ino) => ino,
+                        None => return,
                     }
-                }
-                _ => {
-                    if let Some(ino) = self.resolve(&path) {
-                        if let Ok(d) = self.dir_mut(ino) {
-                            d.marker = None;
-                        }
-                        self.prune(ino);
+                };
+                if let Ok(d) = self.dir_mut(ino) {
+                    if d.mark.is_none() {
+                        d.mode = meta.mode;
+                        d.mtime = meta.mtime;
                     }
+                    d.kept = keep;
                 }
-            },
-            KeyPath::Node(path) => {
-                let (parent_path, name) = split(&path);
-                match winner {
-                    Some(e) if matches!(e.meta.kind, Kind::File | Kind::Symlink) => {
-                        let Some(parent) = self.ensure_dir(store, parent_path) else {
-                            return;
-                        };
-                        match self.child(parent, name) {
-                            None => {
-                                self.alloc(parent, name, body_from_entry(store, &e));
-                            }
-                            Some(ino) => {
-                                let node = self.nodes.get_mut(&ino).expect("child exists");
-                                if matches!(node.body, Body::Dir(_)) || is_dirty(&node.body) {
-                                    return; // directories win; local changes win
+            }
+            Some(leaf) if !path.is_empty() => {
+                let Some(parent) = self.ensure_dir(parent_path) else {
+                    return;
+                };
+                match self.child(parent, name) {
+                    None => {
+                        let body = self.body_from_view(store, &leaf);
+                        self.alloc_remote(parent, name, body);
+                    }
+                    Some(ino) => {
+                        let node = self.nodes.get(&ino).expect("child exists");
+                        match &node.body {
+                            Body::Dir(d) => {
+                                // A file replaced this directory, unless we
+                                // are still changing something in it.
+                                if d.pinned || self.ops_below(path) {
+                                    return;
                                 }
-                                if current_entry_id(&node.body) != Some(e.id) {
-                                    node.body = body_from_entry(store, &e);
+                                self.detach_remote(ino);
+                                let body = self.body_from_view(store, &leaf);
+                                self.alloc_remote(parent, name, body);
+                            }
+                            b if is_dirty(b) => {} // local changes win
+                            b => {
+                                if current_id(b) != view_id(&leaf) {
+                                    let body = self.body_from_view(store, &leaf);
+                                    let node = self.nodes.get_mut(&ino).expect("child exists");
+                                    node.body = body;
                                     node.epoch += 1;
                                 }
                             }
                         }
                     }
-                    _ => {
-                        let Some(ino) = self.resolve(&path) else {
-                            return;
-                        };
-                        let node = self.nodes.get(&ino).expect("resolved");
-                        if matches!(node.body, Body::Dir(_)) || is_dirty(&node.body) {
-                            return;
+                }
+            }
+            Some(_) => {} // the mount root is always a directory
+            None => {
+                let Some(ino) = self.resolve(path) else {
+                    return;
+                };
+                let node = self.nodes.get(&ino).expect("resolved");
+                let parent = node.parent;
+                match &node.body {
+                    Body::Dir(_) => {
+                        if let Ok(d) = self.dir_mut(ino) {
+                            d.kept = false;
                         }
-                        let parent = node.parent;
-                        self.detach(ino);
+                        self.prune(ino);
+                    }
+                    b if is_dirty(b) => {}
+                    _ => {
+                        self.detach_remote(ino);
                         self.prune(parent);
                     }
                 }
@@ -612,8 +702,8 @@ impl State {
     }
 
     /// Finds or creates (as implicit) the directory at `path`. A clean remote
-    /// file in the way is replaced: directories win.
-    fn ensure_dir(&mut self, _store: &Arc<DataStore>, path: &str) -> Option<Ino> {
+    /// file in the way is replaced: the view says a directory is there.
+    fn ensure_dir(&mut self, path: &str) -> Option<Ino> {
         let mut ino = ROOT;
         if path.is_empty() {
             return Some(ino);
@@ -624,8 +714,7 @@ impl State {
                     Body::Dir(_) => c,
                     b if is_dirty(b) => return None,
                     _ => {
-                        tracing::debug!("{path}: a directory hides a file of the same name");
-                        self.detach(c);
+                        self.detach_remote(c);
                         self.alloc_implicit_dir(ino, part)
                     }
                 },
@@ -636,24 +725,50 @@ impl State {
     }
 
     fn alloc_implicit_dir(&mut self, parent: Ino, name: &str) -> Ino {
-        self.alloc(
+        self.alloc_remote(
             parent,
             name,
             Body::Dir(Dir {
                 children: BTreeMap::new(),
-                marker: None,
+                kept: false,
                 pinned: false,
+                mark: None,
+                generation: 0,
                 mode: 0o755,
                 mtime: SystemTime::now(),
             }),
         )
     }
 
+    fn body_from_view(&mut self, store: &Arc<DataStore>, node: &ViewNode) -> Body {
+        match node {
+            ViewNode::Symlink { id, meta, target } => Body::Symlink(Symlink {
+                target: target.clone(),
+                id: Some(*id),
+                mtime: meta.mtime,
+                dirty: false,
+                generation: 0,
+            }),
+            ViewNode::File(f) => Body::File(File {
+                content: Content::Remote(self.remote_file(store, f)),
+                size: f.size,
+                mode: f.meta.mode,
+                mtime: f.meta.mtime,
+                writers: 0,
+                writes_inflight: 0,
+                generation: 0,
+                dirty: false,
+                committed: None,
+            }),
+            ViewNode::Dir { .. } => unreachable!("directories are made by ensure_dir"),
+        }
+    }
+
     // ---- files ------------------------------------------------------------
 
     pub fn add_handle(&mut self, h: Handle) -> u64 {
-        if let Content::Remote(rd) = &h.content {
-            rd.pin();
+        if let Content::Remote(rf) = &h.content {
+            rf.pin();
         }
         if let Some(n) = self.nodes.get_mut(&h.ino) {
             n.open += 1;
@@ -685,7 +800,7 @@ impl State {
     ) -> Result<Option<(Content, bool)>> {
         let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let trunc = flags & libc::O_TRUNC != 0;
-        let key = cfg.keys.node_key(&self.path(ino));
+        let path = self.path(ino);
         let attached = self.node(ino)?.attached;
         let due = Some(Instant::now() + cfg.settle);
         let f = self.file_mut(ino)?;
@@ -700,11 +815,11 @@ impl State {
                 }
                 Content::Local(file)
             }
-            Content::Remote(rd) if !writable && !trunc => {
-                return Ok(Some((Content::Remote(rd), false)));
+            Content::Remote(rf) if !writable && !trunc => {
+                return Ok(Some((Content::Remote(rf), false)));
             }
-            Content::Remote(rd) => {
-                if !trunc && rd.size() > 0 {
+            Content::Remote(rf) => {
+                if !trunc && rf.size() > 0 {
                     return Ok(None);
                 }
                 // Truncated, or empty anyway: nothing to download.
@@ -717,7 +832,7 @@ impl State {
                     f.dirty = true;
                     f.mtime = SystemTime::now();
                 } else {
-                    f.committed = Some(rd.entry.clone());
+                    f.committed = Some(rf);
                 }
                 Content::Local(file)
             }
@@ -731,7 +846,7 @@ impl State {
         }
         if attached && (writable || trunc) {
             self.set_op(
-                &key,
+                &path,
                 PendingOp::Put(ino),
                 if writers > 0 { None } else { due },
             );
@@ -739,22 +854,16 @@ impl State {
         Ok(Some((content, writable)))
     }
 
-    /// Switches a node from `rd` to a local copy of it. False if the node no
-    /// longer holds `rd`.
-    pub fn make_local(
-        &mut self,
-        ino: Ino,
-        rd: &Arc<RemoteData>,
-        local: Arc<DataFile>,
-        _cfg: &VfsConfig,
-    ) -> bool {
+    /// Switches a node from `rf` to a local copy of it. False if the node no
+    /// longer holds `rf`.
+    pub fn make_local(&mut self, ino: Ino, rf: &Arc<RemoteFile>, local: Arc<DataFile>) -> bool {
         let Ok(f) = self.file_mut(ino) else {
             return false;
         };
         match &f.content {
-            Content::Remote(cur) if Arc::ptr_eq(cur, rd) => {
-                f.size = rd.size();
-                f.committed = Some(rd.entry.clone());
+            Content::Remote(cur) if Arc::ptr_eq(cur, rf) => {
+                f.size = rf.size();
+                f.committed = Some(rf.clone());
                 f.content = Content::Local(local);
                 true
             }
@@ -762,15 +871,9 @@ impl State {
         }
     }
 
-    pub fn close_handle(
-        &mut self,
-        h: &Handle,
-        cfg: &VfsConfig,
-        store: &Arc<DataStore>,
-        due: Option<Instant>,
-    ) {
-        if let Content::Remote(rd) = &h.content {
-            rd.unpin();
+    pub fn close_handle(&mut self, h: &Handle, due: Option<Instant>) {
+        if let Content::Remote(rf) = &h.content {
+            rf.unpin();
         }
         let path = self.path(h.ino);
         let Some(node) = self.nodes.get_mut(&h.ino) else {
@@ -779,28 +882,52 @@ impl State {
         node.open = node.open.saturating_sub(1);
         let attached = node.attached;
         let open = node.open;
+        let mut evictable = false;
         if let (true, Body::File(f)) = (h.writable, &mut node.body) {
             f.writers = f.writers.saturating_sub(1);
             if f.writers == 0 {
-                let key = cfg.keys.node_key(&path);
                 if f.dirty && attached {
-                    self.set_op(&key, PendingOp::Put(h.ino), due);
+                    self.set_op(&path, PendingOp::Put(h.ino), due);
                 } else {
-                    make_evictable(f, store);
+                    evictable = true;
                     if attached
                         && self
                             .overlay
-                            .get(&key)
+                            .get(&path)
                             .is_some_and(|p| p.op == PendingOp::Put(h.ino))
                     {
-                        self.clear_op(&key);
+                        self.clear_op(&path);
                     }
                 }
             }
         }
+        if evictable {
+            self.make_evictable(h.ino);
+        }
         if !attached && open == 0 {
             self.nodes.remove(&h.ino);
         }
+    }
+
+    /// Committed local content becomes an evictable cache of the committed
+    /// file: the entry that holds it takes the local copy.
+    pub fn make_evictable(&mut self, ino: Ino) {
+        let Some(Body::File(f)) = self.nodes.get_mut(&ino).map(|n| &mut n.body) else {
+            return;
+        };
+        if f.dirty || f.writers > 0 {
+            return;
+        }
+        let (Content::Local(file), Some(rf)) = (&f.content, &f.committed) else {
+            return;
+        };
+        if let Some((rd, 0)) = rf.range_of() {
+            if rd.size() == rf.size() {
+                // A blob: the local copy is all of it.
+                rd.offer(file.clone());
+            }
+        }
+        f.content = Content::Remote(rf.clone());
     }
 
     // ---- rename -----------------------------------------------------------
@@ -809,7 +936,6 @@ impl State {
     pub fn rename(
         &mut self,
         cfg: &VfsConfig,
-        store: &Arc<DataStore>,
         parent: Ino,
         name: &str,
         newparent: Ino,
@@ -817,7 +943,6 @@ impl State {
         mode: RenameMode,
         due: Option<Instant>,
     ) -> Result<Option<RenameNeeds>> {
-        let _ = store;
         self.dir(parent)?;
         self.dir(newparent)?;
         if !valid_component(newname) {
@@ -832,15 +957,8 @@ impl State {
             return Err(EEXIST);
         }
         let new_path = join(&self.path(newparent), newname);
+        let old_path = self.path(src);
         let src_is_dir = matches!(self.node(src)?.body, Body::Dir(_));
-        let new_key = if src_is_dir {
-            cfg.keys.dir_key(&new_path)
-        } else {
-            cfg.keys.node_key(&new_path)
-        };
-        if new_key.len() > MAX_KEY_LEN {
-            return Err(ENAMETOOLONG);
-        }
 
         if src_is_dir {
             if let Some(d) = dst {
@@ -852,27 +970,33 @@ impl State {
             if self.is_ancestor(src, newparent) {
                 return Err(EINVAL);
             }
-            let old_prefix = cfg.keys.dir_key(&self.path(src));
-            if self.index.any_visible_with_prefix(&old_prefix) {
+            if self.index.any_within(&cfg.full(&old_path)) {
                 // Remote content cannot be moved without copying it.
                 return Err(EXDEV);
             }
             if let Some(d) = dst {
                 self.detach(d);
-                self.retire_key(&new_key, None, due);
+                self.retire(cfg, &new_path, None, due);
             }
             self.move_node(src, newparent, newname);
-            let moved: Vec<(String, PendingOp, Option<Instant>)> = self
-                .overlay
-                .range(old_prefix.clone()..)
-                .take_while(|(k, _)| k.starts_with(&old_prefix))
-                .map(|(k, p)| (k.clone(), p.op.clone(), p.due))
-                .collect();
-            for (key, op, pdue) in moved {
+            // Everything pending in the directory moves with it. (Keys that
+            // sort between "d" and "d/", such as "d.txt", are not in it.)
+            let old_prefix = format!("{old_path}/");
+            let mut moved: Vec<(String, PendingOp, Option<Instant>)> = Vec::new();
+            if let Some(p) = self.overlay.get(&old_path) {
+                moved.push((old_path.clone(), p.op.clone(), p.due));
+            }
+            moved.extend(
+                self.overlay
+                    .range(old_prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&old_prefix))
+                    .map(|(k, p)| (k.clone(), p.op.clone(), p.due)),
+            );
+            for (path, op, pdue) in moved {
                 if let PendingOp::Put(ino) = op {
-                    let suffix = &key[old_prefix.len()..];
-                    self.retire_key(&key, None, due);
-                    self.set_op(&format!("{new_key}{suffix}"), PendingOp::Put(ino), pdue);
+                    let suffix = &path[old_path.len()..];
+                    self.set_op(&format!("{new_path}{suffix}"), PendingOp::Put(ino), pdue);
+                    self.retire(cfg, &path, Some(ino), due);
                 }
             }
             self.pin(parent);
@@ -884,17 +1008,13 @@ impl State {
                 return Err(EISDIR);
             }
         }
-        match &self.node(src)?.body {
-            Body::File(File {
-                content: Content::Remote(rd),
-                ..
-            }) => return Ok(Some(RenameNeeds::Copy(src, rd.clone()))),
-            Body::Symlink(Symlink { target: None, .. }) => {
-                return Ok(Some(RenameNeeds::Target(src)));
-            }
-            _ => {}
+        if let Body::File(File {
+            content: Content::Remote(rf),
+            ..
+        }) = &self.node(src)?.body
+        {
+            return Ok(Some(RenameNeeds::Copy(src, rf.clone())));
         }
-        let old_key = cfg.keys.node_key(&self.path(src));
         if let Some(d) = dst {
             self.detach(d);
         }
@@ -913,24 +1033,24 @@ impl State {
             Body::Dir(_) => unreachable!("handled above"),
         };
         self.set_op(
-            &new_key,
+            &new_path,
             PendingOp::Put(src),
             if writers > 0 { None } else { due },
         );
-        self.retire_key(&old_key, Some(new_key), due);
+        self.retire(cfg, &old_path, Some(src), due);
         self.pin(parent);
         Ok(None)
     }
 
     // ---- unmount ----------------------------------------------------------
 
-    /// Closes all handles, writes markers for directories that would vanish,
-    /// and makes every pending operation due now.
-    pub fn prepare_drain(&mut self, cfg: &VfsConfig, store: &Arc<DataStore>) {
+    /// Closes all handles, keeps directories that would vanish, and makes
+    /// every pending operation due now.
+    pub fn prepare_drain(&mut self) {
         let now = Some(Instant::now());
         let handles: Vec<Handle> = self.handles.drain().map(|(_, h)| h).collect();
         for h in &handles {
-            self.close_handle(h, cfg, store, now);
+            self.close_handle(h, now);
         }
         let empty_dirs: Vec<Ino> = self
             .nodes
@@ -938,22 +1058,24 @@ impl State {
             .filter(|(ino, n)| {
                 **ino != ROOT
                     && n.attached
-                    && matches!(&n.body, Body::Dir(d) if d.pinned && d.children.is_empty() && d.marker.is_none())
+                    && matches!(&n.body, Body::Dir(d) if d.pinned && d.children.is_empty() && !d.kept)
             })
             .map(|(ino, _)| *ino)
             .collect();
         for ino in empty_dirs {
-            let key = cfg.keys.dir_key(&self.path(ino));
-            if key.len() <= MAX_KEY_LEN {
-                self.set_op(&key, PendingOp::Put(ino), now);
+            let path = self.path(ino);
+            if let Ok(d) = self.dir_mut(ino) {
+                d.mark = Some(Mark::Keep);
+                d.generation += 1;
             }
+            self.set_op(&path, PendingOp::Put(ino), now);
         }
-        let keys: Vec<String> = self.overlay.keys().cloned().collect();
-        for key in keys {
-            let p = self.overlay.get_mut(&key).expect("listed");
+        let paths: Vec<String> = self.overlay.keys().cloned().collect();
+        for path in paths {
+            let p = self.overlay.get_mut(&path).expect("listed");
             p.force = true;
             p.attempts = 0;
-            self.schedule(&key, now);
+            self.schedule(&path, now);
         }
     }
 
@@ -962,23 +1084,26 @@ impl State {
         self.overlay.values().all(|p| {
             p.inflight.is_none()
                 && (p.failed
-                    || matches!(&p.op, PendingOp::Delete { after: Some(k) }
-                        if self.overlay.get(k).is_some_and(|q| q.failed)))
+                    || matches!(&p.op, PendingOp::Remove { after: Some(ino) }
+                        if self.pending_put(*ino).is_some_and(|(_, q)| q.failed)))
         })
     }
 
-    /// A creation time for our own new entry that sorts after the current
-    /// winner of its key in our scope.
-    pub fn fresh_created(&self, key: &str) -> SystemTime {
-        let now = SystemTime::now();
-        match self.index.winner(key) {
-            Some(w) if w.scope == 0 && w.created >= now => w.created + Duration::from_micros(1),
-            _ => now,
+    /// The `Put` pending for an inode, wherever it is now, and its path.
+    pub fn pending_put(&self, ino: Ino) -> Option<(String, &Pending)> {
+        if !self.nodes.get(&ino)?.attached {
+            return None;
         }
+        let path = self.path(ino);
+        let p = self
+            .overlay
+            .get(&path)
+            .filter(|p| p.op == PendingOp::Put(ino))?;
+        Some((path, p))
     }
 }
 
-fn is_dirty(body: &Body) -> bool {
+pub(super) fn is_dirty(body: &Body) -> bool {
     match body {
         Body::File(f) => f.dirty || f.writers > 0,
         Body::Symlink(s) => s.dirty,
@@ -986,46 +1111,21 @@ fn is_dirty(body: &Body) -> bool {
     }
 }
 
-fn current_entry_id(body: &Body) -> Option<i64> {
+fn current_id(body: &Body) -> Option<NodeId> {
     match body {
         Body::File(f) => match &f.content {
-            Content::Remote(rd) => Some(rd.entry.id),
-            Content::Local(_) => f.committed.as_ref().map(|e| e.id),
+            Content::Remote(rf) => Some(rf.id),
+            Content::Local(_) => f.committed.as_ref().map(|rf| rf.id),
         },
-        Body::Symlink(s) => s.remote.as_ref().map(|rd| rd.entry.id),
+        Body::Symlink(s) => s.id,
         Body::Dir(_) => None,
     }
 }
 
-fn body_from_entry(store: &Arc<DataStore>, e: &RemoteEntry) -> Body {
-    match e.meta.kind {
-        Kind::Symlink => Body::Symlink(Symlink {
-            target: None,
-            remote: Some(RemoteData::new(store, e.clone())),
-            mtime: e.meta.mtime,
-            dirty: false,
-            generation: 0,
-        }),
-        _ => Body::File(File {
-            content: Content::Remote(RemoteData::new(store, e.clone())),
-            size: e.logical_size(),
-            mode: e.meta.mode,
-            mtime: e.meta.mtime,
-            writers: 0,
-            writes_inflight: 0,
-            generation: 0,
-            dirty: false,
-            committed: None,
-        }),
-    }
-}
-
-/// Committed local content becomes an evictable cache of its entry.
-pub(super) fn make_evictable(f: &mut File, store: &Arc<DataStore>) {
-    if f.dirty || f.writers > 0 {
-        return;
-    }
-    if let (Content::Local(file), Some(entry)) = (&f.content, &f.committed) {
-        f.content = Content::Remote(RemoteData::adopt(store, entry.clone(), file.clone()));
+fn view_id(node: &ViewNode) -> Option<NodeId> {
+    match node {
+        ViewNode::File(f) => Some(f.id),
+        ViewNode::Symlink { id, .. } => Some(*id),
+        ViewNode::Dir { .. } => None,
     }
 }

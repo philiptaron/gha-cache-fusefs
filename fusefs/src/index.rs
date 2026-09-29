@@ -1,23 +1,23 @@
-//! The remote view: listed cache entries, merged across scopes.
-//!
-//! Per key, the highest-precedence scope that has the key decides, and within
-//! a scope the newest entry wins (DESIGN.md §3.3).
+//! The remote view: a volume's layers and blobs, listed in every readable
+//! scope, and the tree the layers make when stacked (LAYERS.md §4).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_util::future::try_join_all;
+use futures_util::{StreamExt, TryStreamExt, stream};
 
-use crate::api::{ApiError, CacheItem, Rest, rest::Direction, rest::PER_PAGE};
-use crate::entry::{Kind, Meta};
+use crate::api::{Api, ApiError, CacheItem, Rest, rest::Direction, rest::PER_PAGE};
+use crate::entry::{self, DIR_XATTR, KeyKind, Kind, Mark, Version, Volume};
+use crate::erofs;
 
-/// A cache entry written by this filesystem.
+/// A cache entry this filesystem wrote, as listed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteEntry {
+pub struct Listed {
     pub key: String,
     pub version: String,
-    pub meta: Meta,
-    /// Blob size (1 for placeholders).
     pub size: u64,
     pub created: SystemTime,
     /// When the service last saw it used: its last download, or its creation.
@@ -27,31 +27,134 @@ pub struct RemoteEntry {
     pub scope: usize,
 }
 
-impl RemoteEntry {
-    /// Size of the file this entry represents.
-    pub fn logical_size(&self) -> u64 {
-        if self.meta.empty { 0 } else { self.size }
-    }
+/// What a listed item is.
+#[derive(Clone, Debug)]
+pub enum Item {
+    /// A layer, whose metadata is its first `meta_blocks` blocks.
+    Layer {
+        entry: Listed,
+        meta_blocks: u32,
+    },
+    Blob {
+        entry: Listed,
+        sha: String,
+    },
+}
 
-    pub fn is_visible(&self) -> bool {
-        self.meta.kind != Kind::Whiteout
-    }
+/// A layer and the tree it holds.
+#[derive(Debug)]
+pub struct Layer {
+    pub entry: Listed,
+    pub meta_blocks: u32,
+    /// Its device slots' tags, in slot order: the blobs it refers to.
+    pub devices: Vec<String>,
+    /// Depth first, the root first.
+    pub entries: Vec<erofs::Entry>,
+    /// The download URL its metadata was read with, if any.
+    pub url: Option<String>,
+}
 
-    fn newer_than(&self, other: &RemoteEntry) -> bool {
-        (self.created, self.id) > (other.created, other.id)
+impl Layer {
+    /// Lists a layer's metadata: at least its first `meta_blocks` blocks.
+    pub fn parse(entry: Listed, meta_blocks: u32, metadata: &[u8]) -> erofs::Result<Layer> {
+        let listing = erofs::read(metadata)?;
+        Ok(Layer {
+            entry,
+            meta_blocks,
+            devices: listing.devices.into_iter().map(|(tag, _)| tag).collect(),
+            entries: listing.entries,
+            url: None,
+        })
     }
 }
 
-#[derive(Debug, Default)]
+/// Which node of which layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    pub layer: i64,
+    pub nid: u64,
+}
+
+/// A file in the view.
+#[derive(Debug)]
+pub struct FileRef {
+    pub id: NodeId,
+    pub meta: erofs::Meta,
+    pub size: u64,
+    pub data: Where,
+}
+
+/// Where a file's bytes are.
+#[derive(Clone, Debug)]
+pub enum Where {
+    /// In the layer's metadata, so already at hand.
+    Inline(Arc<[u8]>),
+    /// At `offset` in a layer.
+    Layer { layer: Arc<Layer>, offset: u64 },
+    /// At `offset` in a blob.
+    Blob { blob: Listed, offset: u64 },
+}
+
+/// A node of the merged tree.
+#[derive(Clone, Debug)]
+pub enum Node {
+    Dir {
+        meta: erofs::Meta,
+        /// The last layer to mark it `keep` or `drop` said `keep`.
+        keep: bool,
+    },
+    File(Arc<FileRef>),
+    Symlink {
+        id: NodeId,
+        meta: erofs::Meta,
+        target: String,
+    },
+}
+
+impl Node {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Node::Dir { .. })
+    }
+
+    /// The same node, for deciding what a new view changed.
+    fn same(&self, other: &Node) -> bool {
+        match (self, other) {
+            (Node::Dir { meta: a, keep: x }, Node::Dir { meta: b, keep: y }) => a == b && x == y,
+            (Node::File(a), Node::File(b)) => {
+                let blob = |f: &FileRef| match &f.data {
+                    Where::Blob { blob, .. } => Some(blob.id),
+                    _ => None,
+                };
+                a.id == b.id && blob(a) == blob(b)
+            }
+            (Node::Symlink { id: a, .. }, Node::Symlink { id: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// The attributes of a directory no layer has.
+pub fn default_dir_meta() -> erofs::Meta {
+    erofs::Meta {
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        mtime: SystemTime::UNIX_EPOCH,
+    }
+}
+
+#[derive(Debug)]
 pub struct Index {
+    volume: Volume,
     scopes: Vec<String>,
-    /// Per scope: key → newest entry.
-    winners: Vec<BTreeMap<String, RemoteEntry>>,
-    /// Per scope: entries superseded by a newer one with the same key.
-    superseded: Vec<Vec<RemoteEntry>>,
+    layers: Vec<Arc<Layer>>,
+    /// By digest: the entry to read a blob from.
+    blobs: HashMap<String, Listed>,
     seen: HashSet<i64>,
     /// Per scope: newest `created` seen, for incremental refreshes.
     watermark: Vec<Option<SystemTime>>,
+    /// The merged tree: every node that exists, by path, the root "" first.
+    view: BTreeMap<String, Node>,
 }
 
 /// How far behind the watermark an incremental refresh looks, to tolerate
@@ -59,14 +162,24 @@ pub struct Index {
 const REFRESH_MARGIN: Duration = Duration::from_secs(120);
 
 impl Index {
-    pub fn new(scopes: Vec<String>) -> Index {
+    pub fn new(volume: Volume, scopes: Vec<String>) -> Index {
         let n = scopes.len();
+        let mut view = BTreeMap::new();
+        view.insert(
+            String::new(),
+            Node::Dir {
+                meta: default_dir_meta(),
+                keep: false,
+            },
+        );
         Index {
+            volume,
             scopes,
-            winners: vec![BTreeMap::new(); n],
-            superseded: vec![Vec::new(); n],
+            layers: Vec::new(),
+            blobs: HashMap::new(),
             seen: HashSet::new(),
             watermark: vec![None; n],
+            view,
         }
     }
 
@@ -74,24 +187,37 @@ impl Index {
         &self.scopes
     }
 
-    /// Converts a listed item, ignoring entries this filesystem did not write.
-    pub fn entry_from_item(&self, item: &CacheItem) -> Option<RemoteEntry> {
-        let meta = Meta::decode(&item.version)?;
+    pub fn volume(&self) -> &Volume {
+        &self.volume
+    }
+
+    /// What a listed item is; `None` for entries this filesystem did not
+    /// write, including format 1's, and for entries already known.
+    pub fn classify(&self, item: &CacheItem) -> Option<Item> {
+        if self.seen.contains(&item.id) {
+            return None;
+        }
+        let version = Version::decode(&item.version)?;
         let scope = self.scopes.iter().position(|s| *s == item.git_ref)?;
-        Some(RemoteEntry {
+        let entry = Listed {
             key: item.key.clone(),
             version: item.version.clone(),
-            meta,
             size: item.size_in_bytes,
             created: item.created(),
             accessed: item.accessed(),
             id: item.id,
             scope,
-        })
+        };
+        match (self.volume.parse(&item.key)?, version.kind) {
+            (KeyKind::Layer, Kind::Layer { meta_blocks }) => {
+                Some(Item::Layer { entry, meta_blocks })
+            }
+            (KeyKind::Blob(sha), Kind::Blob) => Some(Item::Blob { entry, sha }),
+            _ => None,
+        }
     }
 
-    /// Records an entry. Returns whether the merged winner for its key may have changed.
-    pub fn insert(&mut self, e: RemoteEntry) -> bool {
+    fn saw(&mut self, e: &Listed) -> bool {
         if e.scope >= self.scopes.len() || !self.seen.insert(e.id) {
             return false;
         }
@@ -99,144 +225,412 @@ impl Index {
         if wm.is_none_or(|w| w < e.created) {
             *wm = Some(e.created);
         }
-        let winners = &mut self.winners[e.scope];
-        match winners.get(&e.key) {
-            Some(cur) if !e.newer_than(cur) => {
-                self.superseded[e.scope].push(e);
-                false
-            }
-            _ => {
-                let scope = e.scope;
-                if let Some(old) = winners.insert(e.key.clone(), e) {
-                    self.superseded[scope].push(old);
-                }
-                true
-            }
-        }
+        true
     }
 
-    /// Forgets an entry (after deleting it, or when it turns out to be gone).
-    /// Returns whether the merged winner for its key may have changed.
-    pub fn remove(&mut self, key: &str, id: i64) -> bool {
-        let mut changed = false;
-        for scope in 0..self.scopes.len() {
-            self.superseded[scope].retain(|e| e.id != id);
-            if self.winners[scope].get(key).is_some_and(|e| e.id == id) {
-                self.winners[scope].remove(key);
-                // Promote the newest superseded entry, if any.
-                let best = self.superseded[scope]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.key == key)
-                    .max_by(|(_, a), (_, b)| (a.created, a.id).cmp(&(b.created, b.id)))
-                    .map(|(i, _)| i);
-                if let Some(i) = best {
-                    let e = self.superseded[scope].swap_remove(i);
-                    self.winners[scope].insert(key.to_string(), e);
-                }
-                changed = true;
+    /// Records a layer. `restack` then shows it.
+    pub fn insert_layer(&mut self, layer: Layer) -> bool {
+        if !self.saw(&layer.entry) {
+            return false;
+        }
+        self.layers.push(Arc::new(layer));
+        true
+    }
+
+    /// Records a blob. `restack` then shows the files that refer to it.
+    pub fn insert_blob(&mut self, entry: Listed, sha: String) -> bool {
+        if !self.saw(&entry) {
+            return false;
+        }
+        // Of several copies, read the one used last: the one least likely
+        // to be evicted.
+        match self.blobs.get(&sha) {
+            Some(cur) if cur.accessed >= entry.accessed => {}
+            _ => {
+                self.blobs.insert(sha, entry);
             }
         }
+        true
+    }
+
+    /// A blob with this digest, if any readable scope has one.
+    pub fn blob(&self, sha: &str) -> Option<&Listed> {
+        self.blobs.get(sha)
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Stacks the layers again, and returns the paths whose nodes changed,
+    /// sorted, so parents come before their children.
+    pub fn restack(&mut self) -> Vec<String> {
+        let new = self.stack();
+        let mut changed = Vec::new();
+        let (mut a, mut b) = (self.view.iter().peekable(), new.iter().peekable());
+        loop {
+            match (a.peek(), b.peek()) {
+                (None, None) => break,
+                (Some((pa, _)), None) => {
+                    changed.push((*pa).clone());
+                    a.next();
+                }
+                (None, Some((pb, _))) => {
+                    changed.push((*pb).clone());
+                    b.next();
+                }
+                (Some((pa, na)), Some((pb, nb))) => match pa.cmp(pb) {
+                    std::cmp::Ordering::Less => {
+                        changed.push((*pa).clone());
+                        a.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        changed.push((*pb).clone());
+                        b.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if !na.same(nb) {
+                            changed.push((*pa).clone());
+                        }
+                        a.next();
+                        b.next();
+                    }
+                },
+            }
+        }
+        self.view = new;
         changed
     }
 
-    /// The entry that decides `key`: from the highest-precedence scope that has
-    /// it. It may be a whiteout.
-    pub fn winner(&self, key: &str) -> Option<&RemoteEntry> {
-        self.winners.iter().find_map(|w| w.get(key))
-    }
-
-    /// The winner for `key` if it is not a whiteout.
-    pub fn visible(&self, key: &str) -> Option<&RemoteEntry> {
-        self.winner(key).filter(|e| e.is_visible())
-    }
-
-    /// Whether any scope below the run's own has an entry (of any kind) for `key`.
-    pub fn in_lower_scope(&self, key: &str) -> bool {
-        self.winners.iter().skip(1).any(|w| w.contains_key(key))
-    }
-
-    /// Every key some scope has an entry for.
-    pub fn keys(&self) -> BTreeSet<String> {
-        self.winners
-            .iter()
-            .flat_map(|w| w.keys().cloned())
-            .collect()
-    }
-
-    /// Whether some visible entry has a key starting with `prefix`.
-    pub fn any_visible_with_prefix(&self, prefix: &str) -> bool {
-        let keys: BTreeSet<&String> = self
-            .winners
-            .iter()
-            .flat_map(|w| {
-                w.range(prefix.to_string()..)
-                    .take_while(|(k, _)| k.starts_with(prefix))
-            })
-            .map(|(k, _)| k)
-            .collect();
-        keys.into_iter().any(|k| self.visible(k).is_some())
-    }
-
-    /// What the view depends on although no read ever uses it, last used
-    /// before `cutoff`, the stalest first: directory markers, empty files,
-    /// and whiteouts that hide something.
-    pub fn unused_dependencies(&self, cutoff: SystemTime, max: usize) -> Vec<RemoteEntry> {
-        // Per scope, keys with older entries that a whiteout of that scope hides.
-        let hidden: Vec<HashSet<&str>> = self
-            .superseded
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .filter(|e| e.is_visible())
-                    .map(|e| e.key.as_str())
-                    .collect()
-            })
-            .collect();
-        let mut out = Vec::new();
-        for (scope, winners) in self.winners.iter().enumerate() {
-            for (key, e) in winners {
-                let shadowed = self.winners[..scope].iter().any(|w| w.contains_key(key));
-                if e.accessed >= cutoff || shadowed {
-                    continue;
-                }
-                let depended_on = match e.meta.kind {
-                    Kind::Dir => true,
-                    Kind::File => e.meta.empty,
-                    Kind::Symlink => false,
-                    Kind::Whiteout => {
-                        hidden[scope].contains(key.as_str())
-                            || self.winners[scope + 1..]
-                                .iter()
-                                .any(|w| w.get(key).is_some_and(RemoteEntry::is_visible))
-                    }
+    /// Applies the layers bottom up, as LAYERS.md §4 says.
+    fn stack(&self) -> BTreeMap<String, Node> {
+        enum Stacked {
+            Dir {
+                meta: erofs::Meta,
+                /// Some layer marked it `keep` or `attrs`.
+                attrs_marked: bool,
+                /// The last `keep` or `drop` mark.
+                mark: Option<Mark>,
+            },
+            Leaf(Node),
+            /// A file whose blob is gone: it hides what is below, but is
+            /// not there itself.
+            Gone,
+        }
+        let mut order: Vec<&Arc<Layer>> = self.layers.iter().collect();
+        order.sort_by_key(|l| (Reverse(l.entry.scope), l.entry.created, l.entry.id));
+        let mut tree: BTreeMap<String, Stacked> = BTreeMap::new();
+        tree.insert(
+            String::new(),
+            Stacked::Dir {
+                meta: default_dir_meta(),
+                attrs_marked: false,
+                mark: None,
+            },
+        );
+        let remove_below = |tree: &mut BTreeMap<String, Stacked>, path: &str| {
+            let prefix = format!("{path}/");
+            let below: Vec<String> = tree
+                .range(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in below {
+                tree.remove(&k);
+            }
+        };
+        for layer in order {
+            let mut unreadable = 0;
+            for e in &layer.entries {
+                let id = NodeId {
+                    layer: layer.entry.id,
+                    nid: e.nid,
                 };
-                if depended_on {
-                    out.push(e);
+                match &e.kind {
+                    _ if e.is_whiteout() => {
+                        if matches!(tree.get(&e.path), Some(Stacked::Leaf(_) | Stacked::Gone)) {
+                            tree.remove(&e.path);
+                        }
+                    }
+                    erofs::EntryKind::Dir => {
+                        let marked = e.xattr(DIR_XATTR).and_then(Mark::parse);
+                        let sets_attrs = matches!(marked, Some(Mark::Keep | Mark::Attrs));
+                        let new_mark = marked.filter(|m| *m != Mark::Attrs);
+                        match tree.get_mut(&e.path) {
+                            Some(Stacked::Dir {
+                                meta,
+                                attrs_marked,
+                                mark,
+                            }) => {
+                                if sets_attrs || !*attrs_marked {
+                                    *meta = e.meta;
+                                }
+                                *attrs_marked |= sets_attrs;
+                                if new_mark.is_some() {
+                                    *mark = new_mark;
+                                }
+                            }
+                            _ => {
+                                tree.insert(
+                                    e.path.clone(),
+                                    Stacked::Dir {
+                                        meta: e.meta,
+                                        attrs_marked: sets_attrs,
+                                        mark: new_mark,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    erofs::EntryKind::File | erofs::EntryKind::Symlink(_) if !e.path.is_empty() => {
+                        let leaf = match &e.kind {
+                            erofs::EntryKind::Symlink(target) => {
+                                Some(Stacked::Leaf(Node::Symlink {
+                                    id,
+                                    meta: e.meta,
+                                    target: target.clone(),
+                                }))
+                            }
+                            _ => match self.locate(layer, e) {
+                                Ok(Some(data)) => {
+                                    Some(Stacked::Leaf(Node::File(Arc::new(FileRef {
+                                        id,
+                                        meta: e.meta,
+                                        size: e.size,
+                                        data,
+                                    }))))
+                                }
+                                Ok(None) => Some(Stacked::Gone),
+                                Err(()) => {
+                                    unreadable += 1;
+                                    None
+                                }
+                            },
+                        };
+                        if let Some(leaf) = leaf {
+                            remove_below(&mut tree, &e.path);
+                            tree.insert(e.path.clone(), leaf);
+                        }
+                    }
+                    // Nothing we write, and nothing a mount can show.
+                    _ => {}
+                }
+            }
+            if unreadable > 0 {
+                tracing::warn!(
+                    "{}: {unreadable} files are laid out in ways this version cannot read",
+                    layer.entry.key
+                );
+            }
+        }
+
+        // A directory exists while it is kept, or anything below it exists.
+        let mut needed: HashSet<&str> = HashSet::new();
+        needed.insert("");
+        for (path, s) in &tree {
+            let anchor = match s {
+                Stacked::Leaf(_) => true,
+                Stacked::Dir { mark, .. } => *mark == Some(Mark::Keep),
+                Stacked::Gone => false,
+            };
+            if !anchor {
+                continue;
+            }
+            let mut p = path.as_str();
+            while !p.is_empty() {
+                p = entry::parent(p);
+                if !needed.insert(p) {
+                    break;
                 }
             }
         }
-        out.sort_by_key(|e| e.accessed);
-        out.into_iter().take(max).cloned().collect()
+        let mut view = BTreeMap::new();
+        for (path, s) in &tree {
+            match s {
+                Stacked::Leaf(node) => {
+                    view.insert(path.clone(), node.clone());
+                }
+                Stacked::Dir { meta, mark, .. } => {
+                    let keep = *mark == Some(Mark::Keep);
+                    if keep || needed.contains(path.as_str()) {
+                        view.insert(path.clone(), Node::Dir { meta: *meta, keep });
+                    }
+                }
+                Stacked::Gone => {}
+            }
+        }
+        view
     }
 
-    /// Superseded entries of the run's own scope, for garbage collection.
-    pub fn take_superseded_own(&mut self) -> Vec<RemoteEntry> {
-        std::mem::take(&mut self.superseded[0])
+    /// Where a file's bytes are: `Ok(None)` if its blob is gone, and
+    /// `Err` for layouts our writer never uses.
+    fn locate(&self, layer: &Arc<Layer>, e: &erofs::Entry) -> Result<Option<Where>, ()> {
+        match &e.data {
+            erofs::Data::None => Ok(Some(Where::Inline(Arc::from(&[][..])))),
+            erofs::Data::Flat {
+                blocks: 0, tail, ..
+            } => Ok(Some(Where::Inline(Arc::from(tail.as_slice())))),
+            erofs::Data::Flat { start, tail, .. } if tail.is_empty() => Ok(Some(Where::Layer {
+                layer: layer.clone(),
+                offset: start * erofs::BLOCK,
+            })),
+            erofs::Data::Flat { .. } => Err(()),
+            erofs::Data::Chunks { chunk_size, chunks } => {
+                // One device, and consecutive chunks: one range of one entry.
+                let first = chunks.first().ok_or(())?;
+                let start = first.start.ok_or(())?;
+                let blocks_per_chunk = chunk_size / erofs::BLOCK;
+                let contiguous = chunks.iter().enumerate().all(|(i, c)| {
+                    c.device == first.device && c.start == Some(start + i as u64 * blocks_per_chunk)
+                });
+                if !contiguous {
+                    return Err(());
+                }
+                let offset = start * erofs::BLOCK;
+                if first.device == 0 {
+                    return Ok(Some(Where::Layer {
+                        layer: layer.clone(),
+                        offset,
+                    }));
+                }
+                let sha = layer.devices.get(first.device as usize - 1).ok_or(())?;
+                Ok(self.blobs.get(sha).map(|blob| Where::Blob {
+                    blob: blob.clone(),
+                    offset,
+                }))
+            }
+        }
     }
 
-    /// Visible entries' total size, for `statfs`.
+    /// The node at a path of the volume.
+    pub fn get(&self, path: &str) -> Option<&Node> {
+        self.view.get(path)
+    }
+
+    /// Whether a file or symlink is at `path`: what a whiteout would hide.
+    pub fn leaf_at(&self, path: &str) -> bool {
+        self.view.get(path).is_some_and(|n| !n.is_dir())
+    }
+
+    /// Whether a layer keeps the directory at `path`.
+    pub fn kept(&self, path: &str) -> bool {
+        matches!(self.view.get(path), Some(Node::Dir { keep: true, .. }))
+    }
+
+    /// Whether anything is at or below `path` (other than the root).
+    pub fn any_within(&self, path: &str) -> bool {
+        if path.is_empty() {
+            return self.view.len() > 1;
+        }
+        let prefix = format!("{path}/");
+        self.view.contains_key(path)
+            || self
+                .view
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(k, _)| k.starts_with(&prefix))
+    }
+
+    /// Every path in the view, sorted, parents first.
+    pub fn paths(&self) -> impl Iterator<Item = &String> {
+        self.view.keys()
+    }
+
+    /// Visible files' total size, for `statfs`.
     pub fn visible_bytes(&self) -> u64 {
-        self.keys()
-            .iter()
-            .filter_map(|k| self.visible(k))
-            .map(|e| e.size)
+        self.view
+            .values()
+            .map(|n| match n {
+                Node::File(f) => f.size,
+                _ => 0,
+            })
             .sum()
+    }
+
+    /// Blobs that visible files refer to, last used before `cutoff`, the
+    /// stalest first. Nothing else keeps them alive (LAYERS.md §7).
+    pub fn stale_blobs(&self, cutoff: SystemTime, max: usize) -> Vec<Listed> {
+        let mut seen = HashSet::new();
+        let mut out: Vec<&Listed> = self
+            .view
+            .values()
+            .filter_map(|n| match n {
+                Node::File(f) => match &f.data {
+                    Where::Blob { blob, .. } if blob.accessed < cutoff => Some(blob),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .filter(|b| seen.insert(b.id))
+            .collect();
+        out.sort_by_key(|b| b.accessed);
+        out.into_iter().take(max).cloned().collect()
     }
 
     pub fn watermarks(&self) -> Vec<Option<SystemTime>> {
         self.watermark.clone()
     }
+
+    /// A creation time for our own new layer that stacks it above every
+    /// layer of our scope.
+    pub fn fresh_created(&self) -> SystemTime {
+        let now = SystemTime::now();
+        let newest = self
+            .layers
+            .iter()
+            .filter(|l| l.entry.scope == 0)
+            .map(|l| l.entry.created)
+            .max();
+        match newest {
+            Some(t) if t >= now => t + Duration::from_micros(1),
+            _ => now,
+        }
+    }
+}
+
+/// Reads the metadata of layers, a few at a time. Layers that are gone, or
+/// that cannot be read, are left out; errors of the service are not.
+pub async fn read_layers(api: &Api, layers: Vec<(Listed, u32)>) -> Result<Vec<Layer>, ApiError> {
+    let read = stream::iter(layers)
+        .map(|(entry, meta_blocks)| read_layer(api, entry, meta_blocks))
+        .buffer_unordered(LAYER_READS)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(read.into_iter().flatten().collect())
+}
+
+/// Layers whose metadata is read at once.
+const LAYER_READS: usize = 16;
+
+async fn read_layer(api: &Api, entry: Listed, meta_blocks: u32) -> Result<Option<Layer>, ApiError> {
+    let len = (u64::from(meta_blocks) * erofs::BLOCK).min(entry.size);
+    for attempt in 0..3 {
+        let Some(url) = api.twirp.download_url(&entry.key, &entry.version).await? else {
+            tracing::debug!("{}: gone before its metadata was read", entry.key);
+            return Ok(None);
+        };
+        let bytes = match api.blob.get_range(&url, 0, len).await {
+            Ok(b) => b,
+            // Expired URLs, or a blob that moved: resolve again.
+            Err(ApiError::Expired | ApiError::NotFound) if attempt < 2 => continue,
+            Err(ApiError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        return match Layer::parse(entry.clone(), meta_blocks, &bytes) {
+            Ok(mut layer) => {
+                layer.url = Some(url);
+                Ok(Some(layer))
+            }
+            Err(e) => {
+                tracing::warn!("{}: not a layer this version can read: {e}", entry.key);
+                Ok(None)
+            }
+        };
+    }
+    Err(ApiError::Server(format!(
+        "{}: download URL keeps being rejected",
+        entry.key
+    )))
 }
 
 /// Lists every entry under `prefix` in each scope.
@@ -326,139 +720,453 @@ pub async fn list_since(
     Ok(out)
 }
 
+/// A layer image holding `files` (paths and contents) in directories that
+/// pass through, for tests and benchmarks that need layers quickly.
+pub fn layer_image(files: &[(String, Vec<u8>)]) -> erofs::Result<(Vec<u8>, Version)> {
+    use erofs::{FileData, Image, Node as ImageNode, NodeKind};
+    let meta = |mode| erofs::Meta {
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: SystemTime::now(),
+    };
+    let mut image = Image::new(meta(0o755));
+    for (path, _) in files {
+        let mut p = entry::parent(path);
+        while !p.is_empty() {
+            image.insert(
+                p,
+                ImageNode {
+                    meta: meta(0o755),
+                    kind: NodeKind::Dir,
+                    xattrs: Vec::new(),
+                },
+            )?;
+            p = entry::parent(p);
+        }
+    }
+    for (path, data) in files {
+        image.insert(
+            path,
+            ImageNode {
+                meta: meta(0o644),
+                kind: NodeKind::File(FileData::Here {
+                    len: data.len() as u64,
+                    source: Box::new(std::io::Cursor::new(data.clone())),
+                }),
+                xattrs: Vec::new(),
+            },
+        )?;
+    }
+    let mut out = Vec::new();
+    let written = image.write_to(&mut out)?;
+    Ok((out, Version::layer(written.meta_blocks as u32)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::Kind;
+    use erofs::{FileData, Image, Node as ImageNode, NodeKind};
 
-    fn meta(kind: Kind) -> Meta {
-        Meta::new(kind, 0o644, SystemTime::UNIX_EPOCH)
-    }
+    const SECS: u64 = 1_790_000_000;
 
-    fn entry(key: &str, id: i64, scope: usize, secs: u64, kind: Kind) -> RemoteEntry {
-        let meta = meta(kind);
-        RemoteEntry {
-            key: key.into(),
-            version: meta.encode(),
-            meta,
-            size: 1,
-            created: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            accessed: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
-            id,
-            scope,
+    fn meta(mode: u16, secs: u64) -> erofs::Meta {
+        erofs::Meta {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(SECS + secs),
         }
     }
 
+    enum N<'a> {
+        Dir(Option<Mark>),
+        File(&'a [u8]),
+        Link(&'a str),
+        Whiteout,
+        /// A file on the first device.
+        OnBlob(u64),
+    }
+
+    /// A parsed layer from `(path, node)`s. Ancestors must be listed.
+    fn layer(id: i64, scope: usize, secs: u64, nodes: &[(&str, N)], blobs: &[&str]) -> Layer {
+        let mut image = Image::new(meta(0o755, secs));
+        for sha in blobs {
+            image
+                .add_device(erofs::Device {
+                    tag: sha.to_string(),
+                    blocks: 1 << 12,
+                })
+                .unwrap();
+        }
+        for (path, n) in nodes {
+            let (kind, xattrs, mode) = match n {
+                N::Dir(mark) => (
+                    NodeKind::Dir,
+                    mark.map(|m| vec![(DIR_XATTR.to_string(), m.as_bytes().to_vec())])
+                        .unwrap_or_default(),
+                    0o700,
+                ),
+                N::File(data) => (
+                    NodeKind::File(FileData::Here {
+                        len: data.len() as u64,
+                        source: Box::new(std::io::Cursor::new(data.to_vec())),
+                    }),
+                    Vec::new(),
+                    0o644,
+                ),
+                N::Link(t) => (NodeKind::Symlink(t.to_string()), Vec::new(), 0o777),
+                N::Whiteout => (NodeKind::Whiteout, Vec::new(), 0),
+                N::OnBlob(len) => (
+                    NodeKind::File(FileData::Device {
+                        len: *len,
+                        device: 1,
+                        start: 0,
+                    }),
+                    Vec::new(),
+                    0o644,
+                ),
+            };
+            image
+                .insert(
+                    path,
+                    ImageNode {
+                        meta: meta(mode, secs),
+                        kind,
+                        xattrs,
+                    },
+                )
+                .unwrap();
+        }
+        let mut out = Vec::new();
+        let written = image.write_to(&mut out).unwrap();
+        let entry = Listed {
+            key: format!("gha-fs/default/layer/{id:016x}"),
+            version: String::new(),
+            size: out.len() as u64,
+            created: SystemTime::UNIX_EPOCH + Duration::from_secs(SECS + secs),
+            accessed: SystemTime::UNIX_EPOCH + Duration::from_secs(SECS + secs),
+            id,
+            scope,
+        };
+        Layer::parse(entry, written.meta_blocks as u32, &out).unwrap()
+    }
+
     fn index() -> Index {
-        Index::new(vec!["refs/heads/feature".into(), "refs/heads/main".into()])
+        Index::new(
+            Volume::new("default").unwrap(),
+            vec!["refs/heads/feature".into(), "refs/heads/main".into()],
+        )
+    }
+
+    fn paths(ix: &Index) -> Vec<&str> {
+        ix.paths().map(String::as_str).collect()
+    }
+
+    fn content(ix: &Index, path: &str) -> Option<Vec<u8>> {
+        match ix.get(path)? {
+            Node::File(f) => match &f.data {
+                Where::Inline(b) => Some(b.to_vec()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     #[test]
-    fn newest_entry_in_a_scope_wins() {
+    fn newer_layers_and_nearer_scopes_win() {
         let mut ix = index();
-        assert!(ix.insert(entry("k", 1, 0, 10, Kind::File)));
-        assert!(ix.insert(entry("k", 2, 0, 20, Kind::File)));
-        assert!(!ix.insert(entry("k", 3, 0, 15, Kind::File)));
-        assert_eq!(ix.winner("k").unwrap().id, 2);
+        ix.insert_layer(layer(1, 0, 10, &[("f", N::File(b"own, old"))], &[]));
+        ix.insert_layer(layer(2, 1, 99, &[("f", N::File(b"main, newest"))], &[]));
+        ix.insert_layer(layer(3, 0, 20, &[("f", N::File(b"own, new"))], &[]));
+        assert_eq!(ix.restack(), ["", "f"]);
+        assert_eq!(content(&ix, "f").unwrap(), b"own, new");
         assert!(
-            !ix.insert(entry("k", 2, 0, 20, Kind::File)),
+            !ix.insert_layer(layer(3, 0, 20, &[], &[])),
             "duplicates are ignored"
         );
-        let mut sup: Vec<i64> = ix.take_superseded_own().iter().map(|e| e.id).collect();
-        sup.sort();
-        assert_eq!(sup, [1, 3]);
     }
 
     #[test]
-    fn own_scope_shadows_lower_scopes_regardless_of_age() {
+    fn whiteouts_hide_files_but_leave_directories_alone() {
         let mut ix = index();
-        ix.insert(entry("k", 1, 0, 10, Kind::File));
-        ix.insert(entry("k", 2, 1, 99, Kind::File));
-        assert_eq!(ix.winner("k").unwrap().id, 1);
-        assert!(ix.in_lower_scope("k"));
+        ix.insert_layer(layer(
+            1,
+            1,
+            10,
+            &[
+                ("f", N::File(b"x")),
+                ("d", N::Dir(None)),
+                ("d/g", N::File(b"y")),
+                ("l", N::Link("f")),
+            ],
+            &[],
+        ));
+        ix.insert_layer(layer(
+            2,
+            0,
+            20,
+            &[("d", N::Whiteout), ("f", N::Whiteout), ("l", N::Whiteout)],
+            &[],
+        ));
+        ix.restack();
+        assert_eq!(paths(&ix), ["", "d", "d/g"]);
     }
 
     #[test]
-    fn whiteouts_hide_lower_scopes() {
+    fn files_replace_directories_and_directories_replace_files() {
         let mut ix = index();
-        ix.insert(entry("k", 1, 1, 10, Kind::File));
-        assert!(ix.visible("k").is_some());
-        ix.insert(entry("k", 2, 0, 20, Kind::Whiteout));
-        assert!(ix.visible("k").is_none());
-        assert!(ix.winner("k").is_some());
+        ix.insert_layer(layer(
+            1,
+            0,
+            10,
+            &[
+                ("d", N::Dir(None)),
+                ("d/f", N::File(b"x")),
+                ("g", N::File(b"y")),
+            ],
+            &[],
+        ));
+        ix.insert_layer(layer(
+            2,
+            0,
+            20,
+            &[
+                ("d", N::File(b"now a file")),
+                ("g", N::Dir(Some(Mark::Keep))),
+            ],
+            &[],
+        ));
+        let changed = ix.restack();
+        assert_eq!(paths(&ix), ["", "d", "g"]);
+        assert!(!ix.get("d").unwrap().is_dir());
+        assert!(ix.kept("g"));
+        // The first stack reports everything; a restack only what changed.
+        assert_eq!(changed, ["", "d", "g"]);
+        ix.insert_layer(layer(3, 0, 30, &[("d", N::Whiteout)], &[]));
+        assert_eq!(ix.restack(), ["", "d"]);
     }
 
     #[test]
-    fn removing_the_winner_promotes_the_next_newest() {
+    fn directory_marks() {
         let mut ix = index();
-        ix.insert(entry("k", 1, 0, 10, Kind::File));
-        ix.insert(entry("k", 2, 0, 30, Kind::File));
-        ix.insert(entry("k", 3, 0, 20, Kind::File));
-        assert!(ix.remove("k", 2));
-        assert_eq!(ix.winner("k").unwrap().id, 3);
-        assert!(!ix.remove("k", 99));
+        // Kept and emptied; only passed through; kept, then dropped; and
+        // dropped with something still below it.
+        ix.insert_layer(layer(
+            1,
+            1,
+            10,
+            &[
+                ("kept", N::Dir(Some(Mark::Keep))),
+                ("kept/f", N::File(b"x")),
+                ("passed", N::Dir(None)),
+                ("passed/f", N::File(b"x")),
+                ("dropped", N::Dir(Some(Mark::Keep))),
+                ("busy", N::Dir(Some(Mark::Keep))),
+                ("busy/f", N::File(b"x")),
+            ],
+            &[],
+        ));
+        ix.insert_layer(layer(
+            2,
+            0,
+            20,
+            &[
+                ("kept", N::Dir(None)),
+                ("kept/f", N::Whiteout),
+                ("passed", N::Dir(None)),
+                ("passed/f", N::Whiteout),
+                ("dropped", N::Dir(Some(Mark::Drop))),
+                ("busy", N::Dir(Some(Mark::Drop))),
+            ],
+            &[],
+        ));
+        ix.restack();
+        assert_eq!(paths(&ix), ["", "busy", "busy/f", "kept"]);
+        assert!(!ix.kept("busy"));
     }
 
     #[test]
-    fn what_nothing_reads_but_the_view_needs() {
+    fn attributes_come_from_the_last_mark() {
         let mut ix = index();
-        // A whiteout hiding the default branch's file, and one hiding nothing.
-        ix.insert(entry("p/hidden", 1, 1, 10, Kind::File));
-        ix.insert(entry("p/hidden", 2, 0, 20, Kind::Whiteout));
-        ix.insert(entry("p/nothing", 3, 0, 20, Kind::Whiteout));
-        // A whiteout hiding an older version in its own scope.
-        ix.insert(entry("p/rewritten", 4, 0, 10, Kind::File));
-        ix.insert(entry("p/rewritten", 5, 0, 20, Kind::Whiteout));
-        ix.insert(entry("p/dir/", 6, 0, 20, Kind::Dir));
-        let mut empty = entry("p/empty", 7, 0, 20, Kind::File);
-        empty.meta.empty = true;
-        ix.insert(empty);
-        ix.insert(entry("p/file", 8, 0, 20, Kind::File));
-        ix.insert(entry("p/fresh/", 9, 0, 1000, Kind::Dir));
-        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
-        let mut ids: Vec<i64> = ix
-            .unused_dependencies(cutoff, 10)
-            .iter()
-            .map(|e| e.id)
-            .collect();
-        ids.sort();
-        assert_eq!(ids, [2, 5, 6, 7]);
-        assert_eq!(ix.unused_dependencies(cutoff, 2).len(), 2);
+        ix.insert_layer(layer(
+            1,
+            0,
+            10,
+            &[("d", N::Dir(Some(Mark::Attrs))), ("d/f", N::File(b""))],
+            &[],
+        ));
+        ix.insert_layer(layer(
+            2,
+            0,
+            20,
+            &[("d", N::Dir(None)), ("d/g", N::File(b""))],
+            &[],
+        ));
+        ix.restack();
+        let Some(Node::Dir { meta: m, .. }) = ix.get("d") else {
+            panic!("no directory")
+        };
+        assert_eq!(
+            m.mtime,
+            meta(0, 10).mtime,
+            "a layer passing through does not change them"
+        );
+        ix.insert_layer(layer(
+            3,
+            0,
+            30,
+            &[("e", N::Dir(None)), ("e/f", N::File(b""))],
+            &[],
+        ));
+        ix.insert_layer(layer(
+            4,
+            0,
+            40,
+            &[("e", N::Dir(None)), ("e/g", N::File(b""))],
+            &[],
+        ));
+        ix.restack();
+        let Some(Node::Dir { meta: m, .. }) = ix.get("e") else {
+            panic!("no directory")
+        };
+        assert_eq!(
+            m.mtime,
+            meta(0, 40).mtime,
+            "without marks, the last layer that has it"
+        );
     }
 
     #[test]
-    fn prefix_visibility() {
+    fn files_on_blobs_need_their_blob() {
+        let sha = "c".repeat(64);
         let mut ix = index();
-        ix.insert(entry("p/a/x", 1, 1, 10, Kind::File));
-        ix.insert(entry("p/b/y", 2, 1, 10, Kind::File));
-        ix.insert(entry("p/b/y", 3, 0, 20, Kind::Whiteout));
-        assert!(ix.any_visible_with_prefix("p/a/"));
-        assert!(!ix.any_visible_with_prefix("p/b/"));
-        assert!(!ix.any_visible_with_prefix("p/c/"));
+        ix.insert_layer(layer(1, 1, 10, &[("f", N::File(b"old"))], &[]));
+        ix.insert_layer(layer(2, 0, 20, &[("f", N::OnBlob(20 << 20))], &[&sha]));
+        ix.restack();
+        assert_eq!(
+            paths(&ix),
+            [""],
+            "a missing blob hides the file, and what it replaced"
+        );
+        let blob = Listed {
+            key: format!("gha-fs/default/blob/{sha}"),
+            version: String::new(),
+            size: 20 << 20,
+            created: SystemTime::now(),
+            accessed: SystemTime::UNIX_EPOCH,
+            id: 7,
+            scope: 1,
+        };
+        ix.insert_blob(blob, sha.clone());
+        assert_eq!(ix.restack(), ["f"]);
+        match ix.get("f") {
+            Some(Node::File(f)) => {
+                assert_eq!(f.size, 20 << 20);
+                assert!(matches!(&f.data, Where::Blob { blob, offset: 0 } if blob.id == 7));
+            }
+            other => panic!("{other:?}"),
+        }
+        let stale = ix.stale_blobs(SystemTime::now(), 10);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(ix.visible_bytes(), 20 << 20);
     }
 
     #[test]
-    fn foreign_items_are_ignored() {
+    fn what_is_within() {
+        let mut ix = index();
+        assert!(!ix.any_within(""));
+        ix.insert_layer(layer(
+            1,
+            0,
+            10,
+            &[("a", N::Dir(None)), ("a/b", N::File(b"x"))],
+            &[],
+        ));
+        ix.restack();
+        assert!(ix.any_within(""));
+        assert!(ix.any_within("a"));
+        assert!(ix.any_within("a/b"));
+        assert!(!ix.any_within("a/c"));
+        assert!(ix.leaf_at("a/b"));
+        assert!(!ix.leaf_at("a"));
+    }
+
+    #[test]
+    fn classifying_listed_items() {
         let ix = index();
-        let item = CacheItem {
+        let item = |key: &str, version: String, git_ref: &str| CacheItem {
             id: 1,
-            git_ref: "refs/heads/main".into(),
-            key: "Linux-cargo-abc".into(),
-            version: "a".repeat(64),
+            git_ref: git_ref.into(),
+            key: key.into(),
+            version,
             size_in_bytes: 5,
             created_at: "2026-01-01T00:00:00Z".into(),
             last_accessed_at: String::new(),
         };
-        assert!(ix.entry_from_item(&item).is_none());
-        let ours = CacheItem {
-            version: meta(Kind::File).encode(),
-            ..item.clone()
+        let layer_key = ix.volume().layer_key(1);
+        let blob_key = ix.volume().blob_key(&"a".repeat(64));
+        let main = "refs/heads/main";
+        assert!(matches!(
+            ix.classify(&item(&layer_key, Version::layer(3).encode(), main)),
+            Some(Item::Layer { meta_blocks: 3, entry }) if entry.scope == 1
+        ));
+        assert!(matches!(
+            ix.classify(&item(&blob_key, Version::blob().encode(), main)),
+            Some(Item::Blob { .. })
+        ));
+        // Mismatched kinds, foreign versions, other volumes, other refs.
+        assert!(
+            ix.classify(&item(&blob_key, Version::layer(3).encode(), main))
+                .is_none()
+        );
+        assert!(
+            ix.classify(&item(&layer_key, "a".repeat(64), main))
+                .is_none()
+        );
+        let other = Volume::new("other").unwrap().layer_key(1);
+        assert!(
+            ix.classify(&item(&other, Version::layer(3).encode(), main))
+                .is_none()
+        );
+        assert!(
+            ix.classify(&item(
+                &layer_key,
+                Version::layer(3).encode(),
+                "refs/heads/x"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_layers_parse() {
+        let (image, version) = layer_image(&[
+            ("a/b/c".into(), b"hello".to_vec()),
+            ("d".into(), vec![7; 5000]),
+        ])
+        .unwrap();
+        let Kind::Layer { meta_blocks } = version.kind else {
+            panic!()
         };
-        assert_eq!(ix.entry_from_item(&ours).unwrap().scope, 1);
-        let other_ref = CacheItem {
-            git_ref: "refs/heads/elsewhere".into(),
-            ..ours
+        let entry = Listed {
+            key: String::new(),
+            version: version.encode(),
+            size: image.len() as u64,
+            created: SystemTime::now(),
+            accessed: SystemTime::now(),
+            id: 1,
+            scope: 0,
         };
-        assert!(ix.entry_from_item(&other_ref).is_none());
+        let parsed =
+            Layer::parse(entry, meta_blocks, &image[..meta_blocks as usize * 4096]).unwrap();
+        let mut ix = index();
+        ix.insert_layer(parsed);
+        ix.restack();
+        assert_eq!(paths(&ix), ["", "a", "a/b", "a/b/c", "d"]);
+        assert_eq!(content(&ix, "a/b/c").unwrap(), b"hello");
+        assert!(
+            matches!(ix.get("d"), Some(Node::File(f)) if matches!(f.data, Where::Layer { .. }))
+        );
     }
 }
