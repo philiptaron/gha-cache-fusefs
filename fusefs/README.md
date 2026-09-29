@@ -61,6 +61,24 @@ and the default branch — are layered like overlayfs. [DESIGN.md](DESIGN.md)
 covers the details, including what the cache service actually does as
 measured with a probe workflow.
 
+## Next to actions/cache
+
+The mount and `actions/cache` share the repository's cache storage and
+nothing else:
+
+* **`actions/cache` entries never appear in the mount**, even when their keys
+  fall under the mount's prefix. Their versions (a hash of the cached paths)
+  lack the filesystem's marker, so the listing skips them.
+* **`actions/cache` never restores what the mount wrote**, not even through
+  `restore-keys`. Its lookups include its own version, which never matches.
+* **The mount never changes `actions/cache` entries.** Deletions are
+  whiteouts of its own keys, and `gc` only removes its own superseded entries.
+* Both draw on the same quota, LRU eviction, and entry-creation rate limit,
+  and both follow the same branch scoping.
+
+They can be used in the same job. CI checks all of this against the real
+service with this repository's own `save`/`restore` actions.
+
 ## Permissions and limits
 
 * The REST API is the only way to list the cache, so the token (default
