@@ -57,7 +57,7 @@ Each file is one cache entry whose key is the path under a prefix (default
 `fusefs/`). Inode metadata is encoded in the entry's 64-hex-digit *version*,
 so listing the cache is enough to `stat` everything. Deletions are
 *whiteouts*. The scopes a run can read — its own ref, the pull request's base,
-and the default branch — are layered like overlayfs. [DESIGN.md](DESIGN.md)
+and the default branch — are layered like overlayfs. [DESIGN.md](fusefs/DESIGN.md)
 covers the details, including what the cache service actually does as
 measured with a probe workflow.
 
@@ -77,7 +77,7 @@ nothing else:
   and both follow the same branch scoping.
 
 They can be used in the same job. CI checks all of this against the real
-service with this repository's own `save`/`restore` actions.
+service with `actions/cache/save` and `actions/cache/restore`.
 
 ## Permissions and limits
 
@@ -135,14 +135,14 @@ to `run:` steps. Export it yourself, then drive the binary directly:
 
 ```sh
 nix develop            # cargo, clippy, rustfmt, rust-analyzer
-cd fusefs && cargo test
+(cd fusefs && cargo test)
 nix flake check        # tests, clippy, rustfmt, and on Linux a NixOS VM test
 ```
 
 The tests run against `gha-cache-fusefs fake-server`, a local imitation of
 the cache service with the semantics measured against the real one. The core
-filesystem logic (`src/vfs`) is independent of FUSE, so everything except the
-kernel adapter is tested on macOS too. `tests/e2e.sh` runs real tools through
-the kernel; CI runs it against the fake service in a NixOS VM, as an
-unprivileged user on a runner, and across three dependent jobs against the
-real cache.
+filesystem logic (`fusefs/src/vfs`) is independent of FUSE, so everything
+except the kernel adapter is tested on macOS too. `fusefs/tests/e2e.sh` runs
+real tools through the kernel; CI runs it against the fake service in a
+NixOS VM, as an unprivileged user on a runner, and across three dependent
+jobs against the real cache.

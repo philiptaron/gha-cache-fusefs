@@ -308,9 +308,8 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
   anything was lost.
 * `ACTIONS_CACHE_MODE=read` mounts read-only; `none` refuses to mount.
 * Runner tokens are only visible to actions, not to `run:` steps. The
-  `mount/` action (a dependency-free `node24` action next to this repository's
-  `restore/` and `save/`) passes them to the daemon in `main` and unmounts in
-  `post`, which also writes a job summary. It finds the binary in the
+  `mount/` action (a dependency-free `node24` action) passes them to the
+  daemon in `main` and unmounts in `post`, which also writes a job summary. It finds the binary in the
   `binary` input, the release for its ref (published by `fusefs-release`),
   or builds it from its own checkout with Nix or with the runner's cargo:
 
