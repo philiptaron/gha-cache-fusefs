@@ -1,0 +1,49 @@
+name: fusefs-bench
+
+# Runs the benchmarks of fusefs/PERFORMANCE.md against the real cache, and
+# against the model of it that the fake service implements, so the two can be
+# compared. Manual only: a full run creates about 2,500 entries, and the
+# entry-creation rate limit is shared by every job in the repository.
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: 'quick (a few minutes) or full (about fifteen)'
+        type: choice
+        options: [quick, full]
+        default: quick
+
+permissions:
+  # Listing entries, and deleting the large ones afterwards.
+  actions: write
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix build --print-build-logs .#static
+      - name: Export the runtime token to run steps
+        uses: actions/github-script@v9
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_SERVICE_V2', 'ACTIONS_CACHE_MODE']) {
+              if (process.env[k] !== undefined) core.exportVariable(k, process.env[k])
+            }
+      - name: Against the real cache
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCALE: ${{ inputs.scale }}
+        run: result/bin/gha-cache-fusefs --log warn bench --service real --scale "$SCALE" --json real.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Against the model
+        env:
+          SCALE: ${{ inputs.scale }}
+        run: result/bin/gha-cache-fusefs --log warn bench --service hosted --scale "$SCALE" --json hosted.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ inputs.scale }}
+          path: '*.json'
+          if-no-files-found: ignore

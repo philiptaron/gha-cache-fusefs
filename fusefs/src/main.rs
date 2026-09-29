@@ -6,10 +6,11 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 
 use gha_cache_fusefs::api::Api;
+use gha_cache_fusefs::bench;
 use gha_cache_fusefs::config::Env;
 use gha_cache_fusefs::data::DataStore;
 use gha_cache_fusefs::entry::KeySpace;
@@ -40,6 +41,10 @@ enum Cmd {
     /// Run a fake cache service, for tests.
     #[command(hide = true)]
     FakeServer(FakeArgs),
+    /// Measure the filesystem core against the fake service or the real cache
+    /// (see PERFORMANCE.md).
+    #[command(hide = true)]
+    Bench(BenchArgs),
 }
 
 #[derive(Args)]
@@ -104,6 +109,76 @@ struct FakeArgs {
     url_ttl: Duration,
     #[arg(long)]
     fail_blob_every: Option<u64>,
+    /// `hosted` adds the real service's latency, bandwidth, and rate limit.
+    #[arg(long, value_enum, default_value_t = Profile::Local)]
+    profile: Profile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Profile {
+    /// Answer at once, as fast as possible, with no limits.
+    Local,
+    /// Behave like the real service seen from a hosted runner.
+    Hosted,
+}
+
+impl Profile {
+    fn config(self) -> FakeConfig {
+        match self {
+            Profile::Local => FakeConfig::default(),
+            Profile::Hosted => FakeConfig::hosted(),
+        }
+    }
+}
+
+#[derive(Args)]
+struct BenchArgs {
+    /// The fake service with the real one's latency, bandwidth, and rate
+    /// limit (`hosted`) or without them (`local`), or the cache of the
+    /// current Actions job (`real`).
+    #[arg(long, value_enum, default_value_t = BenchService::Hosted)]
+    service: BenchService,
+    #[arg(long, value_enum, default_value_t = Scale::Quick)]
+    scale: Scale,
+    /// Scenarios to run, comma-separated: large, small, mount, throttled.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// The number of small files.
+    #[arg(long)]
+    files: Option<usize>,
+    /// The size of the large file, in MiB.
+    #[arg(long)]
+    large_mib: Option<u64>,
+    /// The number of entries in the listing that `mount` mounts.
+    #[arg(long)]
+    entries: Option<usize>,
+    #[arg(long)]
+    random_reads: Option<usize>,
+    /// With `--service real`: the key prefix to work below; a directory for
+    /// this run is added.
+    #[arg(long, default_value = "bench/")]
+    prefix: String,
+    /// Also write the results as JSON.
+    #[arg(long)]
+    json: Option<PathBuf>,
+    /// The environment variable holding the REST API token.
+    #[arg(long, default_value = "GITHUB_TOKEN")]
+    token_env: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BenchService {
+    Hosted,
+    Local,
+    Real,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Scale {
+    /// A few minutes against the hosted model.
+    Quick,
+    /// Ten minutes or so.
+    Full,
 }
 
 fn main() -> ExitCode {
@@ -112,6 +187,7 @@ fn main() -> ExitCode {
         Cmd::Mount(args) => mount(args, &cli.log),
         Cmd::Unmount(args) => unmount(args),
         Cmd::FakeServer(args) => fake_server(args, &cli.log),
+        Cmd::Bench(args) => bench(args, &cli.log),
     };
     match result {
         Ok(code) => code,
@@ -544,7 +620,7 @@ fn fake_server(args: FakeArgs, log: &str) -> anyhow::Result<ExitCode> {
         let cfg = FakeConfig {
             url_ttl: args.url_ttl,
             fail_blob_every: args.fail_blob_every,
-            ..FakeConfig::default()
+            ..args.profile.config()
         };
         let server = FakeServer::bind(args.listen, cfg).await?;
         let env = server.env("refs/heads/main", &[]);
@@ -568,4 +644,65 @@ fn fake_server(args: FakeArgs, log: &str) -> anyhow::Result<ExitCode> {
         server.wait().await;
         anyhow::Ok(ExitCode::SUCCESS)
     })
+}
+
+fn bench(args: BenchArgs, log: &str) -> anyhow::Result<ExitCode> {
+    init_logging(log);
+    let mut sizes = match args.scale {
+        Scale::Quick => bench::Sizes::quick(),
+        Scale::Full => bench::Sizes::full(),
+    };
+    sizes.files = args.files.unwrap_or(sizes.files);
+    sizes.large_mib = args.large_mib.unwrap_or(sizes.large_mib);
+    sizes.entries = args.entries.unwrap_or(sizes.entries);
+    sizes.random_reads = args.random_reads.unwrap_or(sizes.random_reads);
+    let name = args.service.to_possible_value().expect("not skipped");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let rows = rt.block_on(async {
+        let service = match args.service {
+            BenchService::Hosted => bench::Service::Fake(FakeConfig::hosted()),
+            BenchService::Local => bench::Service::Fake(FakeConfig::default()),
+            BenchService::Real => {
+                let mut env = Env::from_process(&args.token_env)?;
+                env.check_mode()?;
+                if !env.cache_mode.writable() {
+                    bail!("this run may not write to the cache");
+                }
+                if env.default_branch.is_none() {
+                    env.default_branch = Api::new(&env)?.rest.default_branch().await.ok();
+                }
+                let run = match (
+                    std::env::var("GITHUB_RUN_ID"),
+                    std::env::var("GITHUB_RUN_ATTEMPT"),
+                ) {
+                    (Ok(id), Ok(attempt)) => format!("{id}-{attempt}"),
+                    _ => std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs()
+                        .to_string(),
+                };
+                let prefix = format!("{}{run}/", KeySpace::new(&args.prefix).prefix());
+                bench::Service::Real { env, prefix }
+            }
+        };
+        bench::run(&service, &sizes, &args.only).await
+    })?;
+    println!(
+        "### gha-cache-fusefs bench: {}\n\n{}.\n\n{}",
+        name.get_name(),
+        sizes.describe(),
+        bench::markdown(&rows)
+    );
+    if let Some(path) = &args.json {
+        let doc = serde_json::json!({
+            "service": name.get_name(),
+            "sizes": sizes,
+            "rows": rows,
+        });
+        write_atomically(path, &serde_json::to_vec_pretty(&doc)?)?;
+    }
+    rt.shutdown_timeout(Duration::from_secs(1));
+    Ok(ExitCode::SUCCESS)
 }

@@ -1,7 +1,8 @@
 //! The mutable state behind the filesystem's lock: inodes, handles, the remote
 //! index, and the overlay of pending operations.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -100,7 +101,8 @@ pub(super) enum PendingOp {
 pub(super) struct Pending {
     pub op: PendingOp,
     pub op_id: u64,
-    /// When the op becomes eligible; `None` while the file is open for writing.
+    /// When the op becomes eligible; `None` while the file is open for
+    /// writing. Set it with `State::schedule`, which also queues the op.
     pub due: Option<Instant>,
     /// Eligible even while the file is open for writing (fsync, unmount).
     pub force: bool,
@@ -126,6 +128,10 @@ pub(super) struct State {
     next_op: u64,
     pub index: Index,
     pub overlay: BTreeMap<String, Pending>,
+    /// Overlay ops by due time, earliest first, so that the committer looks
+    /// only at what is due. An entry lapses when its op is rescheduled,
+    /// starts, fails, or goes away; `queued` tells.
+    pub queue: BinaryHeap<Reverse<(Instant, String)>>,
     pub last_refresh: Instant,
     /// Directories whose small files were already prefetched.
     pub prefetched_dirs: HashSet<Ino>,
@@ -161,6 +167,7 @@ impl State {
             next_op: 1,
             index,
             overlay: BTreeMap::new(),
+            queue: BinaryHeap::new(),
             last_refresh: Instant::now(),
             prefetched_dirs: HashSet::new(),
         }
@@ -478,11 +485,40 @@ impl State {
             p.op = op;
             p.op_id = op_id;
         }
-        p.due = due;
         p.force = false;
         p.attempts = 0;
         p.error = None;
         p.failed = false;
+        self.schedule(key, due);
+    }
+
+    /// Sets when the op at `key` becomes eligible, and queues it for then.
+    pub fn schedule(&mut self, key: &str, due: Option<Instant>) {
+        let Some(p) = self.overlay.get_mut(key) else {
+            return;
+        };
+        p.due = due;
+        if let Some(t) = due {
+            self.queue.push(Reverse((t, key.to_string())));
+        }
+    }
+
+    /// Whether a queue entry still stands for an op waiting to be attempted.
+    pub fn queued(&self, key: &str, due: Instant) -> bool {
+        self.overlay
+            .get(key)
+            .is_some_and(|p| p.due == Some(due) && p.inflight.is_none() && !p.failed)
+    }
+
+    /// When the next queued op becomes eligible. Drops lapsed entries.
+    pub fn next_due(&mut self) -> Option<Instant> {
+        while let Some(Reverse((due, key))) = self.queue.peek() {
+            if self.queued(key, *due) {
+                return Some(*due);
+            }
+            self.queue.pop();
+        }
+        None
     }
 
     /// Drops an op that turned out to be unnecessary.
@@ -912,10 +948,12 @@ impl State {
                 self.set_op(&key, PendingOp::Put(ino), now);
             }
         }
-        for p in self.overlay.values_mut() {
-            p.due = now;
+        let keys: Vec<String> = self.overlay.keys().cloned().collect();
+        for key in keys {
+            let p = self.overlay.get_mut(&key).expect("listed");
             p.force = true;
             p.attempts = 0;
+            self.schedule(&key, now);
         }
     }
 

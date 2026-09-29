@@ -1,12 +1,12 @@
 //! The filesystem core against the fake cache service: every test plays
 //! several "jobs" that mount the same cache one after another.
 
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gha_cache_fusefs::api::Api;
 use gha_cache_fusefs::data::DataStore;
-use gha_cache_fusefs::entry::KeySpace;
-use gha_cache_fusefs::fake::{FakeConfig, FakeServer};
+use gha_cache_fusefs::entry::{KeySpace, Kind, Meta};
+use gha_cache_fusefs::fake::{FakeConfig, FakeServer, RateLimit};
 use gha_cache_fusefs::vfs::{
     Attr, Errno, FileKind, Ino, ROOT, RenameMode, SetAttr, SetTime, Vfs, VfsConfig,
 };
@@ -421,6 +421,181 @@ async fn transient_service_failures_are_retried() {
     }
     assert_eq!(cat(&b, "big").await, noise(20 << 20, 99));
     assert!(server.blob_requests() > 20);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limited_creations_wait_and_are_reported() {
+    let server = FakeServer::start(FakeConfig {
+        create_limit: Some(RateLimit {
+            calls: 5,
+            window: Duration::from_secs(2),
+        }),
+        ..FakeConfig::default()
+    })
+    .await
+    .unwrap();
+    let a = job(&server, MAIN).await;
+    for i in 0..8 {
+        write_file(&a, ROOT, &format!("f{i}"), b"x");
+    }
+    let summary = a.drain().await;
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!(summary.uploaded_files, 8);
+    assert!(summary.rate_limited >= 1);
+    assert!(summary.rate_limit_pause_ms >= 1000, "{summary:?}");
+    // Create and finalize for each file, plus the refused creations.
+    assert_eq!(summary.requests.cache_service, 16 + summary.rate_limited);
+    assert_eq!(summary.requests.blob, 8);
+    assert_eq!(summary.requests.rest, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limit_on_creating_entries_does_not_hold_up_reads() {
+    let server = FakeServer::start(FakeConfig {
+        create_limit: Some(RateLimit {
+            calls: 2,
+            window: Duration::from_secs(5),
+        }),
+        ..FakeConfig::default()
+    })
+    .await
+    .unwrap();
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "target", b"read me");
+    drained(&a).await;
+
+    let b = job(&server, MAIN).await;
+    let target = lookup(&b, "target").await.unwrap();
+    for i in 0..3 {
+        write_file(&b, ROOT, &format!("f{i}"), b"x");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.summary().rate_limited == 0 {
+        assert!(Instant::now() < deadline, "never rate limited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Uploads now wait for the window to close; downloads do not.
+    let t = Instant::now();
+    assert_eq!(read_file(&b, target.ino).await, b"read me");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exhausted_rest_budget_fails_fast() {
+    let server = server().await;
+    let a = job_with(&server, MAIN, |c| c.refresh = Some(Duration::ZERO)).await;
+    let reset = SystemTime::now() + Duration::from_secs(3600);
+    server.set_config(|c| c.rest_exhausted_until = Some(reset));
+
+    // Lookups of missing names refresh; they must not wait an hour for it.
+    let t = Instant::now();
+    for _ in 0..3 {
+        assert_eq!(
+            lookup(&a, "missing").await.unwrap_err(),
+            Errno(libc::ENOENT)
+        );
+    }
+    // Nor does a mount, which fails and says why.
+    let env = server.env(MAIN, &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let store = DataStore::new(&dir.path().join("data"), 1 << 30, 8).unwrap();
+    let cfg = VfsConfig::new(KeySpace::new("fusefs/"));
+    let loaded = Vfs::load(cfg, Api::new(&env).unwrap(), store, env.scopes()).await;
+    let err = format!("{:#}", loaded.err().expect("the listing is refused"));
+    assert!(err.contains("rate limited; try again in"), "{err}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    // Uploads go on.
+    write_file(&a, ROOT, "f", b"x");
+    drained(&a).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequential_reads_fetch_whole_runs() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let data = noise(64 << 20, 5);
+    write_file(&a, ROOT, "f", &data);
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    let before = server.blob_requests();
+    assert_eq!(cat(&b, "f").await, data);
+    // 8 MiB ranges, and a few smaller ones while the window grows.
+    let gets = server.blob_requests() - before;
+    assert!(gets <= 14, "{gets} range requests");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entries_deleted_during_a_listing_do_not_hide_others() {
+    let server = FakeServer::start(FakeConfig {
+        latency: Duration::from_millis(500),
+        ..FakeConfig::default()
+    })
+    .await
+    .unwrap();
+    for i in 0..300 {
+        let version = Meta::new(Kind::File, 0o644, SystemTime::now()).encode();
+        let data = bytes::Bytes::from_static(b"x");
+        server.insert(&format!("fusefs/f{i:03}"), &version, MAIN, data);
+    }
+    let env = server.env(MAIN, &[]);
+    let api = Api::new(&env).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = DataStore::new(&dir.path().join("data"), 1 << 30, 8).unwrap();
+    let mut cfg = VfsConfig::new(KeySpace::new("fusefs/"));
+    cfg.refresh = None;
+    // The first of three pages arrives after 0.5 s, the others after 1 s;
+    // in between, the ten oldest entries are evicted.
+    let evict = async {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        for i in 0..10 {
+            server.remove(&format!("fusefs/f{i:03}"), MAIN);
+        }
+    };
+    let (vfs, ()) = tokio::join!(Vfs::load(cfg, api, store, env.scopes()), evict);
+    let names = ls(&vfs.unwrap(), ROOT);
+    assert_eq!(names.len(), 290);
+    assert_eq!(names[0], "f010");
+    assert!(names.contains(&"f105".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entries_nothing_reads_are_kept_alive() {
+    let server = server().await;
+    let main = job(&server, MAIN).await;
+    write_file(&main, ROOT, "shared", b"from main");
+    write_file(&main, ROOT, "gone", b"from main");
+    drained(&main).await;
+    let feature = job(&server, FEATURE).await;
+    feature.unlink(ROOT, "shared").unwrap();
+    feature.unlink(ROOT, "gone").unwrap();
+    feature.mkdir(ROOT, "empty", 0o755).unwrap();
+    write_file(&feature, ROOT, "stamp", b"");
+    write_file(&feature, ROOT, "data", b"read when needed");
+    drained(&feature).await;
+    // Main's "gone" is evicted, so its whiteout hides nothing. Then four
+    // days pass, as far as the service can tell.
+    server.remove("fusefs/gone", MAIN);
+    server.age(Duration::from_secs(4 * 24 * 3600));
+    let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+
+    let again = job(&server, FEATURE).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while again.summary().touched < 3 {
+        assert!(Instant::now() < deadline, "{:?}", again.summary());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for key in ["fusefs/shared", "fusefs/empty/", "fusefs/stamp"] {
+        assert!(server.last_used(key, FEATURE).unwrap() > stale, "{key}");
+    }
+    // Reads keep regular files alive, and nothing needs the rest.
+    for (key, scope) in [
+        ("fusefs/data", FEATURE),
+        ("fusefs/gone", FEATURE),
+        ("fusefs/shared", MAIN),
+    ] {
+        assert!(server.last_used(key, scope).unwrap() < stale, "{key}");
+    }
+    assert_eq!(again.summary().touched, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

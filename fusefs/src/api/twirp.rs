@@ -1,5 +1,6 @@
 //! The Twirp/JSON cache service reachable with `ACTIONS_RUNTIME_TOKEN`.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -11,9 +12,13 @@ const SERVICE: &str = "twirp/github.actions.results.api.v1.CacheService/";
 const WRITE_DENIED: &str = "cache write denied:";
 const READ_DENIED: &str = "cache read denied:";
 
+/// One client per method, each with a gate of its own: creating entries is
+/// rate limited, and waiting for that must not hold up downloads.
 #[derive(Clone)]
 pub struct Twirp {
-    http: Http,
+    create: Http,
+    finalize: Http,
+    lookup: Http,
     base: String,
     token: String,
 }
@@ -103,7 +108,9 @@ impl Twirp {
         let url = url::Url::parse(results_url)?;
         let base = url.join(&format!("/{SERVICE}"))?.to_string();
         Ok(Twirp {
-            http,
+            create: http.gated(http.retry),
+            finalize: http.gated(http.retry),
+            lookup: http,
             base,
             token: token.to_string(),
         })
@@ -111,43 +118,46 @@ impl Twirp {
 
     async fn call<Req: Serialize, Resp: DeserializeOwned>(
         &self,
+        http: &Http,
         method: &str,
         req: &Req,
     ) -> Result<Resp, ApiError> {
         let url = format!("{}{method}", self.base);
-        self.http
-            .retrying(method, || async {
-                let resp = self
-                    .http
-                    .client
-                    .post(&url)
-                    .bearer_auth(&self.token)
-                    .json(req)
-                    .timeout(Duration::from_secs(60))
-                    .send()
-                    .await
-                    .map_err(ApiError::transport)?;
-                let status = resp.status();
-                let after = retry_after(resp.headers());
-                let body = resp.bytes().await.map_err(ApiError::transport)?;
-                if status.is_success() {
-                    return serde_json::from_slice(&body)
-                        .map_err(|e| ApiError::Server(format!("{method}: bad response: {e}")));
-                }
-                let err: TwirpError =
-                    serde_json::from_slice(&body).unwrap_or_else(|_| TwirpError {
-                        code: String::new(),
-                        msg: String::from_utf8_lossy(&body).chars().take(200).collect(),
-                    });
-                Err(classify(status.as_u16(), &err.code, &err.msg, after))
-            })
-            .await
+        http.retrying(method, || async {
+            http.stats.twirp.fetch_add(1, Ordering::Relaxed);
+            let resp = http
+                .client
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(req)
+                .timeout(Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(ApiError::transport)?;
+            let status = resp.status();
+            let after = retry_after(resp.headers());
+            let body = resp.bytes().await.map_err(ApiError::transport)?;
+            if status.is_success() {
+                return serde_json::from_slice(&body)
+                    .map_err(|e| ApiError::Server(format!("{method}: bad response: {e}")));
+            }
+            let err: TwirpError = serde_json::from_slice(&body).unwrap_or_else(|_| TwirpError {
+                code: String::new(),
+                msg: String::from_utf8_lossy(&body).chars().take(200).collect(),
+            });
+            Err(classify(status.as_u16(), &err.code, &err.msg, after))
+        })
+        .await
     }
 
     /// Reserves `(key, version)` and returns the SAS URL to upload the blob to.
     pub async fn create(&self, key: &str, version: &str) -> Result<String, ApiError> {
         let resp: CreateResp = self
-            .call("CreateCacheEntry", &CreateReq { key, version })
+            .call(
+                &self.create,
+                "CreateCacheEntry",
+                &CreateReq { key, version },
+            )
             .await?;
         if !resp.ok || resp.signed_upload_url.is_empty() {
             return Err(if resp.message.starts_with(WRITE_DENIED) {
@@ -165,6 +175,7 @@ impl Twirp {
     pub async fn finalize(&self, key: &str, version: &str, size: u64) -> Result<i64, ApiError> {
         let resp: FinalizeResp = self
             .call(
+                &self.finalize,
                 "FinalizeCacheEntryUpload",
                 &FinalizeReq {
                     key,
@@ -190,6 +201,7 @@ impl Twirp {
     pub async fn download_url(&self, key: &str, version: &str) -> Result<Option<String>, ApiError> {
         let resp: GetResp = self
             .call(
+                &self.lookup,
                 "GetCacheEntryDownloadURL",
                 &GetReq {
                     key,

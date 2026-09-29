@@ -1,5 +1,6 @@
 //! Azure Blob storage, addressed through SAS URLs handed out by the cache service.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use base64::Engine;
@@ -62,6 +63,7 @@ impl Blob {
         let len = body.len() as u64;
         self.http
             .retrying(what, || async {
+                self.http.stats.blob.fetch_add(1, Ordering::Relaxed);
                 let mut req = self
                     .http
                     .client
@@ -113,6 +115,7 @@ impl Blob {
         let range = format!("bytes={}-{}", offset, offset + len - 1);
         self.http
             .retrying("Get Blob", || async {
+                self.http.stats.blob.fetch_add(1, Ordering::Relaxed);
                 let resp = self
                     .http
                     .client

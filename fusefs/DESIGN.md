@@ -66,7 +66,8 @@ ranges reached ~52 MB/s. Eight parallel 16 MiB block uploads moved 128 MiB in
 about ten seconds, it answered `429` with a `Retry-After` of 30–40 s. The
 budget is per repository: back-to-back jobs share it. Lookups and downloads
 (200 in 46 s) were not limited. A workload of many small files is therefore
-bounded by roughly 200 new files per half minute, whatever the client does.
+bounded by roughly 200 new files per 40–50 s (ten seconds of creating, then
+the wait), whatever the client does.
 
 **REST listing** returns `id, ref, key, version, size_in_bytes, created_at,
 last_accessed_at`. It is immediately consistent and includes only finalized
@@ -179,6 +180,15 @@ LRU eviction removes first anyway.
 A file entry and a directory can collide, for example when two jobs write
 `a` and `a/b` concurrently. The directory wins and the file is hidden.
 
+The service evicts an entry a week after its last *download*, and nothing
+ever downloads a whiteout, a directory marker, or an empty file. Left alone,
+a branch's deletions would come back after a week, and empty files and
+directories would vanish from trees in daily use. So a mount resolves a
+download URL, which counts as use, for such entries it depends on that were
+last used more than three days ago: markers, empty files, and whiteouts that
+hide something. It resolves at most 1,000 per mount, the stalest first.
+Regular files are left to reads, as the cache's LRU intends.
+
 ## 4. Architecture
 
 ```
@@ -195,12 +205,18 @@ A file entry and a directory can collide, for example when two jobs write
 ```
 
 * **`api`** holds three small clients on top of one `reqwest` pool: Twirp,
-  Blob, and REST. They share retry and backoff logic, and a rate-limit gate
-  that honors `Retry-After`. SAS signatures are redacted from all logs.
+  Blob, and REST. They share retry and backoff logic. Each service, and each
+  Twirp method, has a rate-limit gate of its own that honors `Retry-After`,
+  so throttled creations never hold up downloads. REST requests fail rather
+  than wait more than a minute, since an exhausted `GITHUB_TOKEN` budget can
+  take an hour to reset. SAS signatures are redacted from all logs.
 * **`index`** keeps the per-scope listings and computes the merged *remote
-  view*. The initial listing pages are fetched in parallel. A refresh is
-  incremental: it reads pages sorted by `created_at desc` only until it
-  passes the previous high-water mark (minus a margin for clock skew).
+  view*. The initial listing pages are fetched in parallel. Pages are cut by
+  position, so an entry deleted while we page would hide another at a page
+  boundary. Every page reports the total, and a listing whose pages disagree
+  is repeated. A refresh is incremental: it reads pages sorted by
+  `created_at desc` only until it passes the previous high-water mark (minus
+  a margin for clock skew).
 * **`vfs`** is the FUSE-agnostic core. It owns the inode tree, the **local
   overlay** (operations not yet committed; one op per key, latest wins), open
   handles, and directory snapshots. Every operation returns
@@ -208,7 +224,8 @@ A file entry and a directory can collide, for example when two jobs write
 * **`data`** manages local backing files. For content we wrote, the backing
   file is authoritative. For remote content, it is a sparse cache with a 1 MiB
   presence bitmap. Clean files are evicted LRU above `--cache-size-mb`.
-* **`commit`** runs the upload pipeline.
+* **`commit`** runs the upload pipeline. It takes operations from a queue
+  ordered by due time, so its cost follows what is due, not what is pending.
 * **`fuse`** is a thin `fuser::Filesystem` adapter. Requests that stay in
   memory or on local disk (`getattr`, `readdir`, `write`, `create`, …) are
   answered on the FUSE thread; any that may touch the network (`lookup`,
@@ -235,7 +252,8 @@ A file entry and a directory can collide, for example when two jobs write
    * calls `FinalizeCacheEntryUpload`.
    On success the overlay op retires and the backing file becomes clean cache.
 4. **Retries.** `5xx`, network errors, and `429` back off and retry
-   indefinitely while mounted; `429` pauses all traffic until `Retry-After`.
+   indefinitely while mounted; a `429` pauses further creations (but not
+   downloads) until `Retry-After`.
    An ambiguous `Create`/`Finalize` restarts with a new nonce. Permanent
    errors are recorded and reported at unmount.
 5. `fsync` commits the file *now* and waits, even if it is still open for
@@ -262,8 +280,10 @@ changing it means writing a new entry.
   in the sparse backing file and are served with `pread`.
 * **Readahead** is tracked per handle. A sequential reader doubles its window
   from 2 MiB up to 64 MiB and prefetches that far ahead, which turns the
-  ~250 ms first-byte latency into streaming throughput. Random readers only
-  fetch what they touch.
+  ~250 ms first-byte latency into streaming throughput. The chunk the reader
+  needs goes first, in a request of its own. The window is then topped up in
+  whole 8 MiB ranges, since sliding it one read at a time would fetch a chunk
+  per request. Random readers only fetch what they touch.
 * **Sibling prefetch.** The first read of a small remote file (≤ 1 MiB) starts
   background fetches of the other small files in its directory, six at a
   time. `cp -r`, `diff -r`, and `tar c` over a tree of small files then read
@@ -279,7 +299,7 @@ changing it means writing a new entry.
 
 | Operation | Behavior |
 |-----------|----------|
-| `lookup`, `getattr`, `readdir(plus)` | In memory. A miss triggers at most one incremental refresh per `--refresh` interval (default 15 s), so polling for a file another job is writing works. |
+| `lookup`, `getattr`, `readdir(plus)` | In memory. A miss triggers at most one incremental refresh per `--refresh` interval (default 15 s), so polling for a file another job is writing works. The refresh runs in the background, and a lookup waits for it at most 2 s. |
 | `readdir` | Served from a snapshot taken at `opendir`/rewind, so `rm -r` does not skip entries. |
 | `mkdir` / `rmdir` | Local directory. A marker is written at unmount only if it is still empty; `rmdir` whites out an existing marker. `ENOTEMPTY` as usual. |
 | `unlink` | Drops a pending upload. If a remote entry is visible, whites it out. Open handles keep working (unlinked-but-open). |
@@ -333,7 +353,9 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
   ranged GET/HEAD, expiring URLs, injectable 503s), and the REST list/delete
   endpoints, with the probe's observed semantics: prefix fallback, 409s,
   size validation, size ≥ 1, 64-character versions, and scopes encoded in the
-  fake token. It lets the whole stack run offline.
+  fake token. It lets the whole stack run offline. With `--profile hosted` it
+  also imitates the latency, bandwidth, and creation rate limit above, which
+  the benchmarks in [PERFORMANCE.md](PERFORMANCE.md) rely on.
 * **Integration tests** drive the `Vfs` core against the fake service, one
   "job" after another. They cover persistence, overwrite, copy-on-write,
   whiteouts across branch scopes, the three kinds of rename (pending, cached,
@@ -353,7 +375,7 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 ## 10. Future work
 
 * Packing small files into shared entries, to get past the ~200 creations
-  per half minute that the service allows.
+  per 40–50 s that the service allows (see PERFORMANCE.md).
 * Lazy copy-on-write: opening a remote file read-write downloads it at once,
   even if nothing is written.
 * A read-only view of foreign entries (for example `actions/cache` archives).

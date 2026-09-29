@@ -3,7 +3,7 @@
 //! Per key, the highest-precedence scope that has the key decides, and within
 //! a scope the newest entry wins (DESIGN.md §3.3).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use futures_util::future::try_join_all;
@@ -20,6 +20,8 @@ pub struct RemoteEntry {
     /// Blob size (1 for placeholders).
     pub size: u64,
     pub created: SystemTime,
+    /// When the service last saw it used: its last download, or its creation.
+    pub accessed: SystemTime,
     pub id: i64,
     /// Index into the index's scopes; 0 is the run's own ref.
     pub scope: usize,
@@ -82,6 +84,7 @@ impl Index {
             meta,
             size: item.size_in_bytes,
             created: item.created(),
+            accessed: item.accessed(),
             id: item.id,
             scope,
         })
@@ -175,6 +178,48 @@ impl Index {
         keys.into_iter().any(|k| self.visible(k).is_some())
     }
 
+    /// What the view depends on although no read ever uses it, last used
+    /// before `cutoff`, the stalest first: directory markers, empty files,
+    /// and whiteouts that hide something.
+    pub fn unused_dependencies(&self, cutoff: SystemTime, max: usize) -> Vec<RemoteEntry> {
+        // Per scope, keys with older entries that a whiteout of that scope hides.
+        let hidden: Vec<HashSet<&str>> = self
+            .superseded
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .filter(|e| e.is_visible())
+                    .map(|e| e.key.as_str())
+                    .collect()
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (scope, winners) in self.winners.iter().enumerate() {
+            for (key, e) in winners {
+                let shadowed = self.winners[..scope].iter().any(|w| w.contains_key(key));
+                if e.accessed >= cutoff || shadowed {
+                    continue;
+                }
+                let depended_on = match e.meta.kind {
+                    Kind::Dir => true,
+                    Kind::File => e.meta.empty,
+                    Kind::Symlink => false,
+                    Kind::Whiteout => {
+                        hidden[scope].contains(key.as_str())
+                            || self.winners[scope + 1..]
+                                .iter()
+                                .any(|w| w.get(key).is_some_and(RemoteEntry::is_visible))
+                    }
+                };
+                if depended_on {
+                    out.push(e);
+                }
+            }
+        }
+        out.sort_by_key(|e| e.accessed);
+        out.into_iter().take(max).cloned().collect()
+    }
+
     /// Superseded entries of the run's own scope, for garbage collection.
     pub fn take_superseded_own(&mut self) -> Vec<RemoteEntry> {
         std::mem::take(&mut self.superseded[0])
@@ -208,22 +253,51 @@ pub async fn list_all(
         .collect())
 }
 
+/// Listing again when the entries changed while we paged, at most this often.
+const LISTINGS: usize = 3;
+
 async fn list_scope(rest: &Rest, prefix: &str, scope: &str) -> Result<Vec<CacheItem>, ApiError> {
+    // Pages are cut by position, so an entry deleted while we page (by
+    // eviction, or by another job's gc) moves an entry across a page boundary
+    // that we have already read, and we never see it. Every page reports the
+    // total; when they disagree, list again. If no listing is steady, keep
+    // everything any of them saw.
+    let mut seen: HashMap<i64, CacheItem> = HashMap::new();
+    for _ in 0..LISTINGS {
+        let (items, steady) = list_pages(rest, prefix, scope).await?;
+        if steady {
+            return Ok(items);
+        }
+        tracing::debug!("{scope}: entries changed while listing them; listing again");
+        seen.extend(items.into_iter().map(|i| (i.id, i)));
+    }
+    Ok(seen.into_values().collect())
+}
+
+/// One listing, and whether every page saw the same total.
+async fn list_pages(
+    rest: &Rest,
+    prefix: &str,
+    scope: &str,
+) -> Result<(Vec<CacheItem>, bool), ApiError> {
     // Ascending order keeps pages stable while new entries are appended;
     // anything appended while we page is picked up by the next refresh.
     let (total, mut items) = rest.list_page(prefix, scope, Direction::Asc, 1).await?;
     let pages = (total as usize).div_ceil(PER_PAGE);
+    let mut steady = true;
     let mut page = 2;
     while page <= pages {
         // A handful of pages in flight at once.
         let last = pages.min(page + 7);
         let batch = (page..=last).map(|p| rest.list_page(prefix, scope, Direction::Asc, p));
-        for (_, page_items) in try_join_all(batch).await? {
+        for (page_total, page_items) in try_join_all(batch).await? {
+            steady &= page_total == total;
             items.extend(page_items);
         }
         page = last + 1;
     }
-    Ok(items)
+    let steady = steady && items.len() as u64 == total;
+    Ok((items, steady))
 }
 
 /// Lists entries created since `watermark` (minus a margin), newest first.
@@ -269,6 +343,7 @@ mod tests {
             meta,
             size: 1,
             created: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            accessed: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             id,
             scope,
         }
@@ -322,6 +397,33 @@ mod tests {
         assert!(ix.remove("k", 2));
         assert_eq!(ix.winner("k").unwrap().id, 3);
         assert!(!ix.remove("k", 99));
+    }
+
+    #[test]
+    fn what_nothing_reads_but_the_view_needs() {
+        let mut ix = index();
+        // A whiteout hiding the default branch's file, and one hiding nothing.
+        ix.insert(entry("p/hidden", 1, 1, 10, Kind::File));
+        ix.insert(entry("p/hidden", 2, 0, 20, Kind::Whiteout));
+        ix.insert(entry("p/nothing", 3, 0, 20, Kind::Whiteout));
+        // A whiteout hiding an older version in its own scope.
+        ix.insert(entry("p/rewritten", 4, 0, 10, Kind::File));
+        ix.insert(entry("p/rewritten", 5, 0, 20, Kind::Whiteout));
+        ix.insert(entry("p/dir/", 6, 0, 20, Kind::Dir));
+        let mut empty = entry("p/empty", 7, 0, 20, Kind::File);
+        empty.meta.empty = true;
+        ix.insert(empty);
+        ix.insert(entry("p/file", 8, 0, 20, Kind::File));
+        ix.insert(entry("p/fresh/", 9, 0, 1000, Kind::Dir));
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
+        let mut ids: Vec<i64> = ix
+            .unused_dependencies(cutoff, 10)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, [2, 5, 6, 7]);
+        assert_eq!(ix.unused_dependencies(cutoff, 2).len(), 2);
     }
 
     #[test]
