@@ -19,7 +19,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Each run writes below its own directory of the mount.
+  # Each run writes below its own directory of the mount, and each chain of
+  # jobs below its own subdirectory ($RUN/e2e, $RUN/interop, $RUN/action-N):
+  # the e2e phases rm -rf their directory, and a whiteout from one job
+  # rightly hides another job's file.
   RUN: e2e/${{ github.run_id }}-${{ github.run_attempt }}
 
 # The real-cache jobs need a writable cache and `actions: write`, which pull
@@ -112,6 +115,7 @@ jobs:
         env:
           MNT: /mnt/cache
           EXTERNAL_MOUNT: 1
+          RUN: ${{ env.RUN }}/e2e
 
   e2e-read:
     name: "Real cache 2/3: read and modify"
@@ -136,6 +140,7 @@ jobs:
         env:
           MNT: /mnt/cache
           EXTERNAL_MOUNT: 1
+          RUN: ${{ env.RUN }}/e2e
 
   e2e-verify:
     name: "Real cache 3/3: verify and remove"
@@ -158,6 +163,7 @@ jobs:
         env:
           MNT: /mnt/cache
           EXTERNAL_MOUNT: 1
+          RUN: ${{ env.RUN }}/e2e
 
   action:
     name: The mount action on its own (${{ matrix.binary }})
