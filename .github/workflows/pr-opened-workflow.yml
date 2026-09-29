@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   run-action:
+    # Pages the upstream team's on-call; meaningless (and secretless) in forks.
+    if: github.repository == 'actions/cache'
     runs-on: ubuntu-latest
     steps:
       - name: Get current oncall
