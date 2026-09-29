@@ -9,6 +9,7 @@
     environment.systemPackages = [
       package
       pkgs.openssl
+      pkgs.rsync
       pkgs.squashfsTools
       pkgs.squashfuse
     ];

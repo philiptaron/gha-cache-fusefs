@@ -171,7 +171,10 @@ impl Filesystem for FuseFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        // mode_t is u32 on Linux and u16 on macOS.
+        #[allow(clippy::unnecessary_cast)]
+        let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+        if mode & ifmt != ifreg {
             return reply.error(fuser::Errno::EPERM);
         }
         let n = try_reply!(reply, name(n));
