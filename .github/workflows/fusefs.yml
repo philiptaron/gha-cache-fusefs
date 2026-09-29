@@ -202,10 +202,10 @@ jobs:
           df -h /mnt/cache
           if mountpoint -q /mnt/cache2; then ls -la /mnt/cache2; fi
 
-  # Interop with actions/cache (this repository's root action). An entry that
-  # actions/cache saves under the filesystem's prefix must stay invisible to
-  # the mount, and actions/cache must not restore what the mount wrote, not
-  # even through restore-keys prefix matching.
+  # Interop with actions/cache. An entry that actions/cache saves under the
+  # filesystem's prefix must stay invisible to the mount, and actions/cache
+  # must not restore what the mount wrote, not even through restore-keys
+  # prefix matching.
   interop-write:
     name: "Interop 1/2: actions/cache saves, the filesystem looks"
     needs: build
@@ -222,12 +222,12 @@ jobs:
           mkdir interop-src
           echo "saved by actions/cache" >interop-src/file
       - name: actions/cache saves under the filesystem's prefix
-        uses: ./save
+        uses: actions/cache/save@v6
         with:
           key: fusefs/${{ env.RUN }}/interop/from-actions-cache
           path: interop-src
       - name: actions/cache saves elsewhere
-        uses: ./save
+        uses: actions/cache/save@v6
         with:
           key: interop-${{ env.RUN }}
           path: interop-src
@@ -263,20 +263,20 @@ jobs:
       - run: chmod +x bin/gha-cache-fusefs
       - name: actions/cache asks for the key the filesystem wrote
         id: theirs
-        uses: ./restore
+        uses: actions/cache/restore@v6
         with:
           key: fusefs/${{ env.RUN }}/interop/from-fusefs
           path: interop-src
       - name: actions/cache prefix-matches the whole run directory
         id: prefix
-        uses: ./restore
+        uses: actions/cache/restore@v6
         with:
           key: interop-miss-${{ env.RUN }}
           restore-keys: fusefs/${{ env.RUN }}/
           path: interop-src
       - name: actions/cache restores its own entry
         id: own
-        uses: ./restore
+        uses: actions/cache/restore@v6
         with:
           key: fusefs/${{ env.RUN }}/interop/from-actions-cache
           path: interop-src
