@@ -285,6 +285,7 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let signals = signals(&rt)?;
     let started = Instant::now();
     let vfs = rt.block_on(async {
         let api = Api::new(&env)?;
@@ -316,7 +317,7 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
     if !args.daemon {
         println!("{info}");
     }
-    run_session(session, &args.mountpoint, &rt)?;
+    run_session(session, &args.mountpoint, &rt, signals)?;
 
     tracing::info!("unmounted; uploading pending changes");
     let summary: Summary = rt.block_on(vfs.drain());
@@ -390,26 +391,37 @@ fn mount_fuse(
     bail!("mounting is only supported on Linux")
 }
 
+/// SIGTERM and SIGINT, registered as soon as the runtime exists: a signal
+/// that arrives before the session runs is remembered, not fatal.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+fn signals(rt: &tokio::runtime::Runtime) -> anyhow::Result<Signals> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let _guard = rt.enter();
+    Ok(Signals {
+        term: signal(SignalKind::terminate())?,
+        int: signal(SignalKind::interrupt())?,
+    })
+}
+
 /// Serves until unmounted; SIGTERM or SIGINT unmount.
 #[cfg(target_os = "linux")]
 fn run_session(
     mut session: Session,
     mountpoint: &Path,
     rt: &tokio::runtime::Runtime,
+    mut signals: Signals,
 ) -> anyhow::Result<()> {
     let mut unmounter = session.unmount_callable();
     let mountpoint = mountpoint.to_path_buf();
     rt.spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut term), Ok(mut int)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            return;
-        };
         tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+            _ = signals.term.recv() => {}
+            _ = signals.int.recv() => {}
         }
         tracing::info!("signal received; unmounting {}", mountpoint.display());
         if let Err(e) = unmounter.unmount() {
@@ -421,7 +433,12 @@ fn run_session(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_session(_: Session, _: &Path, _: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+fn run_session(
+    _: Session,
+    _: &Path,
+    _: &tokio::runtime::Runtime,
+    _: Signals,
+) -> anyhow::Result<()> {
     Ok(())
 }
 

@@ -13,6 +13,7 @@
       pkgs.squashfsTools
       pkgs.squashfuse
     ];
+    boot.kernelModules = [ "fuse" ];
     virtualisation.memorySize = 2048;
     virtualisation.diskSize = 4096;
   };
@@ -20,7 +21,7 @@
   testScript = ''
     machine.wait_for_unit("multi-user.target")
     machine.succeed(
-        "systemd-run --unit fake-cache gha-cache-fusefs fake-server"
+        "systemd-run --unit fake-cache ${package}/bin/gha-cache-fusefs fake-server"
         + " --listen 127.0.0.1:8123 --env-file /run/fake-cache.env"
     )
     machine.wait_until_succeeds("test -s /run/fake-cache.env")

@@ -216,8 +216,8 @@ A file entry and a directory can collide, for example when two jobs write
 3. **Commit** snapshots the inode's metadata and a content generation counter,
    encodes a version, then:
    * calls `CreateCacheEntry`,
-   * uploads with `Put Blob` (≤ 16 MiB) or with parallel 16 MiB `Put Block`s
-     followed by `Put Block List`,
+   * uploads with `Put Blob` (≤ 16 MiB) or with 8 MiB `Put Block`s, four in
+     flight per file, followed by `Put Block List`,
    * re-checks the generation (a write during the upload aborts this
      attempt; the burned nonce is harmless),
    * calls `FinalizeCacheEntryUpload`.
@@ -226,8 +226,9 @@ A file entry and a directory can collide, for example when two jobs write
    indefinitely while mounted; `429` pauses all traffic until `Retry-After`.
    An ambiguous `Create`/`Finalize` restarts with a new nonce. Permanent
    errors are recorded and reported at unmount.
-5. `fsync` commits the file *now* and waits (from a snapshot copy if the file
-   is still open for writing). It is the explicit durability point.
+5. `fsync` commits the file *now* and waits, even if it is still open for
+   writing; a write that races with the upload makes the attempt start over.
+   It is the explicit durability point.
 6. **Unmount drains.** Every pending op becomes due immediately, markers are
    written for empty directories, and whiteouts are written last. Whiteouts
    produced by `rename` wait for the corresponding `Put` so that a failed
