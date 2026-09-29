@@ -452,8 +452,9 @@ impl Vfs {
                 return Err(EEXIST);
             }
             drop(st);
-            // Racing creators: behave like open(2) on the existing file.
-            return self.open_sync_local(existing, flags | libc::O_TRUNC);
+            // Racing creators: behave like open(2) on the existing file. If
+            // that would mean downloading it, report the race instead.
+            return self.open_sync_local(existing, flags);
         }
         let file = self.0.store.create().map_err(io_err)?;
         let ino = st.alloc(
@@ -482,7 +483,7 @@ impl Vfs {
         let mut st = self.0.st.lock();
         let (content, writable) = st
             .open_local(ino, flags, &self.0.cfg, &self.0.store)?
-            .ok_or(EXDEV)?;
+            .ok_or(EEXIST)?;
         let fh = st.add_handle(Handle::new(ino, content, writable));
         Ok((st.attr(&self.0.cfg, ino), fh))
     }

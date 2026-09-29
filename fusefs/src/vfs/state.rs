@@ -643,14 +643,17 @@ impl State {
                 if !trunc && rd.size() > 0 {
                     return Ok(None);
                 }
+                // Truncated, or empty anyway: nothing to download.
                 let file = store.create().map_err(io_err)?;
                 f.content = Content::Local(file.clone());
                 f.size = 0;
                 f.generation += 1;
-                f.committed = None;
                 if trunc {
+                    f.committed = None;
                     f.dirty = true;
                     f.mtime = SystemTime::now();
+                } else {
+                    f.committed = Some(rd.entry.clone());
                 }
                 Content::Local(file)
             }
@@ -658,11 +661,11 @@ impl State {
         if writable {
             f.writers += 1;
         }
-        let (dirty, writers) = (f.dirty, f.writers);
+        let writers = f.writers;
         if trunc {
             self.bump_epoch(ino);
         }
-        if attached && (writable || dirty) {
+        if attached && (writable || trunc) {
             self.set_op(
                 &key,
                 PendingOp::Put(ino),
