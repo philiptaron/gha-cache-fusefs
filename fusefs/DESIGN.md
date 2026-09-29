@@ -14,7 +14,8 @@ makes the mapping behave like a filesystem.
 ## 1. The service, as measured
 
 The facts below were measured on `ubuntu-24.04` hosted runners in September
-2026 with a throwaway probe workflow. They constrain every later decision.
+2026 by [`probe/probe.sh`](probe/probe.sh) (re-run it with the `fusefs-probe`
+workflow) and by the end-to-end jobs. They constrain every later decision.
 
 **RPC surface.** The runner token (`ACTIONS_RUNTIME_TOKEN`) talks Twirp/JSON to
 `$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/<Method>`.
