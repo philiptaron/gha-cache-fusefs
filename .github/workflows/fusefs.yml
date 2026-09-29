@@ -147,9 +147,26 @@ jobs:
           MNT: /mnt/cache
           EXTERNAL_MOUNT: 1
 
+  action:
+    name: The mount action on its own (builds with the runner's cargo)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./mount
+        with:
+          path: /mnt/cache
+      - name: Smoke test
+        run: |
+          d="/mnt/cache/$RUN/action"
+          mkdir -p "$d"
+          echo "hello from $GITHUB_JOB" > "$d/hello"
+          [ "$(cat "$d/hello")" = "hello from $GITHUB_JOB" ]
+          ls -la "$d"
+          df -h /mnt/cache
+
   e2e-cleanup:
     name: Delete this run's cache entries
-    needs: [e2e-write, e2e-read, e2e-verify]
+    needs: [e2e-write, e2e-read, e2e-verify, action]
     if: always()
     runs-on: ubuntu-24.04
     steps:
