@@ -104,7 +104,8 @@ service with this repository's own `save`/`restore` actions.
 | `gc` | `false` | delete entries that newer writes superseded |
 | `settle` | `1s` | how long a closed file waits before uploading, so write-then-rename uploads only the final name |
 | `cache-size-mb` | `8192` | local disk budget for downloaded data |
-| `binary` | | a prebuilt binary; otherwise the release for the action's ref is downloaded (`vX.Y.Z`, or `main-latest` for `@main`), or it is built with Nix or cargo |
+| `binary` | | a prebuilt binary; otherwise one is downloaded from a release, or built with Nix or cargo |
+| `release` | | the release to download the binary from (`vX.Y.Z`, `main-latest`); by default, the one for the action's ref (`main-latest` for `@main`) |
 | `fail-on-error` | `true` | fail the job if changes could not be saved |
 | `log` | `info` | daemon log filter |
 
