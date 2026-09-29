@@ -14,40 +14,54 @@ function onPath(cmd) {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 }
 
+// Releases are published by the fusefs-release workflow: one per tag, and a
+// rolling `<branch>-latest` prerelease for each push to a release branch.
 async function download(dest) {
   const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
   const ref = process.env.GITHUB_ACTION_REF;
+  const repo = process.env.GITHUB_ACTION_REPOSITORY || 'philiptaron/gha-cache-fusefs';
   if (!arch || !ref) return false;
-  const url = `https://github.com/philiptaron/gha-cache-fusefs/releases/download/${ref}/gha-cache-fusefs-${arch}-linux`;
-  console.log(`Downloading ${url}`);
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    console.log(`  ${resp.status} ${resp.statusText}`);
-    return false;
+  for (const tag of [ref, `${ref}-latest`]) {
+    const url = `https://github.com/${repo}/releases/download/${tag}/gha-cache-fusefs-${arch}-linux`;
+    const resp = await fetch(url);
+    if (!resp.ok) continue;
+    console.log(`Downloaded ${url}`);
+    writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
+    chmodSync(dest, 0o755);
+    return true;
   }
-  writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
-  chmodSync(dest, 0o755);
-  return true;
+  return false;
+}
+
+function build(cmd, args, out) {
+  const r = spawnSync(cmd, args, { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', cwd: repoRoot });
+  if (r.status === 0) return out(r.stdout.trim());
+  error(`${cmd} ${args.join(' ')} failed (exit ${r.status})`);
+  return undefined;
 }
 
 async function binary(temp) {
   const given = input('binary');
   if (given) return resolve(given);
-  if (onPath('nix')) {
-    console.log('Building gha-cache-fusefs with Nix');
-    const r = spawnSync(
-      'nix',
-      ['--extra-experimental-features', 'nix-command flakes', 'build', `path:${repoRoot}#static`, '--no-link', '--print-out-paths'],
-      { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8' }
-    );
-    if (r.status === 0) return join(r.stdout.trim(), 'bin', 'gha-cache-fusefs');
-    error('nix build failed; trying a release download');
-  }
   const dest = join(temp, 'gha-cache-fusefs');
   if (await download(dest)) return dest;
-  throw new Error(
-    'No gha-cache-fusefs binary: pass `binary`, install Nix before this step, or use a released ref of this action'
-  );
+  if (onPath('nix')) {
+    console.log('Building gha-cache-fusefs with Nix');
+    const nixArgs = ['--extra-experimental-features', 'nix-command flakes', 'build', `path:${repoRoot}#static`, '--no-link', '--print-out-paths'];
+    const bin = build('nix', nixArgs, out => join(out, 'bin', 'gha-cache-fusefs'));
+    if (bin) return bin;
+  }
+  if (onPath('cargo')) {
+    // Hosted runners come with Rust; this takes a couple of minutes.
+    console.log('Building gha-cache-fusefs with cargo');
+    const manifest = join(repoRoot, 'fusefs', 'Cargo.toml');
+    const target = join(temp, 'gha-cache-fusefs-target');
+    const bin = build('cargo', ['build', '--release', '--locked', '--manifest-path', manifest, '--target-dir', target], () =>
+      join(target, 'release', 'gha-cache-fusefs')
+    );
+    if (bin) return bin;
+  }
+  throw new Error('No gha-cache-fusefs binary: pass `binary`, or make Nix or cargo available before this step');
 }
 
 function ensureDir(path) {

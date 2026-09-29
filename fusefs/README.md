@@ -86,7 +86,7 @@ measured with a probe workflow.
 | `gc` | `false` | delete entries that newer writes superseded |
 | `settle` | `1s` | how long a closed file waits before uploading, so write-then-rename uploads only the final name |
 | `cache-size-mb` | `8192` | local disk budget for downloaded data |
-| `binary` | | a prebuilt binary; otherwise it is built with Nix, or downloaded from a release |
+| `binary` | | a prebuilt binary; otherwise the release for the action's ref is downloaded (`vX.Y.Z`, or `main-latest` for `@main`), or it is built with Nix or cargo |
 | `fail-on-error` | `true` | fail the job if changes could not be saved |
 | `log` | `info` | daemon log filter |
 
