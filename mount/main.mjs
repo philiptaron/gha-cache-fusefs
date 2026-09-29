@@ -1,6 +1,9 @@
 // Mounts the cache: finds or builds the binary, then starts the daemon, which
 // detaches once the filesystem is live. post.mjs unmounts it.
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+//
+// Everything this action keeps lives under $RUNNER_TEMP/gha-cache-fusefs:
+// bin/<release>/ (downloads), target/ (cargo builds), mount-<hash>/ (state).
+import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -16,21 +19,31 @@ function onPath(cmd) {
 
 // Releases are published by the fusefs-release workflow: one per tag, and a
 // rolling `<branch>-latest` prerelease for each push to a release branch.
-async function download(dest) {
+// The `release` input picks one; by default the action's own ref does.
+async function download(home) {
   const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
   const ref = process.env.GITHUB_ACTION_REF;
   const repo = process.env.GITHUB_ACTION_REPOSITORY || 'philiptaron/gha-cache-fusefs';
-  if (!arch || !ref) return false;
-  for (const tag of [ref, `${ref}-latest`]) {
+  const pinned = input('release');
+  const tags = pinned ? [pinned] : ref ? [ref, `${ref}-latest`] : [];
+  if (!arch) return undefined;
+  for (const tag of tags) {
+    const dest = join(home, 'bin', tag, 'gha-cache-fusefs');
+    // A second mount in the same job reuses the first one's download.
+    if (existsSync(dest)) return dest;
     const url = `https://github.com/${repo}/releases/download/${tag}/gha-cache-fusefs-${arch}-linux`;
     const resp = await fetch(url);
     if (!resp.ok) continue;
     console.log(`Downloaded ${url}`);
-    writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
-    chmodSync(dest, 0o755);
-    return true;
+    mkdirSync(dirname(dest), { recursive: true });
+    // Rename into place, so a running daemon's executable is never rewritten.
+    writeFileSync(`${dest}.tmp`, Buffer.from(await resp.arrayBuffer()));
+    chmodSync(`${dest}.tmp`, 0o755);
+    renameSync(`${dest}.tmp`, dest);
+    return dest;
   }
-  return false;
+  if (pinned) throw new Error(`release ${pinned} has no gha-cache-fusefs-${arch}-linux`);
+  return undefined;
 }
 
 function build(cmd, args, out) {
@@ -40,11 +53,11 @@ function build(cmd, args, out) {
   return undefined;
 }
 
-async function binary(temp) {
+async function binary(home) {
   const given = input('binary');
   if (given) return resolve(given);
-  const dest = join(temp, 'gha-cache-fusefs');
-  if (await download(dest)) return dest;
+  const downloaded = await download(home);
+  if (downloaded) return downloaded;
   if (onPath('nix')) {
     console.log('Building gha-cache-fusefs with Nix');
     const nixArgs = ['--extra-experimental-features', 'nix-command flakes', 'build', `path:${repoRoot}#static`, '--no-link', '--print-out-paths'];
@@ -55,7 +68,7 @@ async function binary(temp) {
     // Hosted runners come with Rust; this takes a couple of minutes.
     console.log('Building gha-cache-fusefs with cargo');
     const manifest = join(repoRoot, 'fusefs', 'Cargo.toml');
-    const target = join(temp, 'gha-cache-fusefs-target');
+    const target = join(home, 'target');
     const bin = build('cargo', ['build', '--release', '--locked', '--manifest-path', manifest, '--target-dir', target], () =>
       join(target, 'release', 'gha-cache-fusefs')
     );
@@ -78,11 +91,11 @@ function ensureDir(path) {
 async function main() {
   if (process.platform !== 'linux') throw new Error('mounting the cache needs Linux');
   const path = resolve(input('path'));
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const bin = await binary(temp);
+  const home = join(process.env.RUNNER_TEMP || '/tmp', 'gha-cache-fusefs');
+  const bin = await binary(home);
   if (!existsSync(bin)) throw new Error(`${bin} does not exist`);
   const hash = createHash('sha256').update(path).digest('hex').slice(0, 12);
-  const stateDir = join(temp, 'gha-cache-fusefs', `mount-${hash}`);
+  const stateDir = join(home, `mount-${hash}`);
   ensureDir(path);
   mkdirSync(stateDir, { recursive: true });
 

@@ -30,7 +30,11 @@ inputs:
     default: '8192'
     required: false
   binary:
-    description: 'Path to a gha-cache-fusefs binary. If empty, the release matching this action''s ref is downloaded, or else the binary is built from the action''s source with Nix or cargo.'
+    description: 'Path to a gha-cache-fusefs binary. If empty, the binary is downloaded from a release (see `release`), or else built from the action''s source with Nix or cargo.'
+    default: ''
+    required: false
+  release:
+    description: 'The release to download the binary from, such as `v1.2.3` or `main-latest`. If empty, the release matching this action''s ref is used when there is one.'
     default: ''
     required: false
   fail-on-error:
