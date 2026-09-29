@@ -30,7 +30,7 @@ inputs:
     default: '8192'
     required: false
   binary:
-    description: 'Path to a gha-cache-fusefs binary. If empty, the binary is built from this action with Nix when Nix is available, and downloaded from the matching release otherwise.'
+    description: 'Path to a gha-cache-fusefs binary. If empty, the release matching this action''s ref is downloaded, or else the binary is built from the action''s source with Nix or cargo.'
     default: ''
     required: false
   fail-on-error:
