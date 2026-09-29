@@ -121,6 +121,7 @@ impl Http {
             .user_agent(concat!("gha-cache-fusefs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(64)
+            .tls_certs_only(root_certificates())
             .build()?;
         Ok(Http {
             client,
@@ -167,6 +168,19 @@ impl Http {
 fn install_crypto_provider() {
     // Fails harmlessly if a provider is already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Mozilla's roots, so a static binary works where the system has none (a
+/// minimal container, the Nix sandbox), plus the system's, so custom CAs (GHES,
+/// TLS-inspecting proxies) keep working.
+fn root_certificates() -> Vec<reqwest::Certificate> {
+    let system = rustls_native_certs::load_native_certs().certs;
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|der| der.as_ref())
+        .chain(system.iter().map(|der| der.as_ref()))
+        .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+        .collect()
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
