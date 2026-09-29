@@ -2,7 +2,8 @@
 //! endpoints, and the REST list/delete endpoints, with the semantics measured
 //! against the real service (DESIGN.md §1). Used by tests and the VM test.
 //!
-//! Runtime tokens name the scopes: `fake|<write ref>|<read ref>,<read ref>`.
+//! Runtime tokens name the scopes: `fake:<write ref>:<read ref>,<read ref>` (refs
+//! cannot contain colons).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -93,7 +94,7 @@ fn scopes_of(headers: &HeaderMap) -> Option<(String, Vec<String>)> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")?;
-    let mut parts = token.split('|');
+    let mut parts = token.split(':');
     if parts.next()? != "fake" {
         return None;
     }
@@ -174,7 +175,7 @@ impl FakeServer {
         }
         Env {
             results_url: format!("{}/", self.inner.base),
-            runtime_token: format!("fake|{git_ref}|{}", read.join(",")),
+            runtime_token: format!("fake:{git_ref}:{}", read.join(",")),
             cache_mode: CacheMode::ReadWrite,
             github_token: Some("fake-github-token".into()),
             api_url: self.inner.base.clone(),

@@ -543,10 +543,19 @@ fn fake_server(args: FakeArgs, log: &str) -> anyhow::Result<ExitCode> {
         };
         let server = FakeServer::bind(args.listen, cfg).await?;
         let env = server.env("refs/heads/main", &[]);
-        let vars = format!(
-            "ACTIONS_RESULTS_URL={}\nACTIONS_RUNTIME_TOKEN={}\nACTIONS_CACHE_SERVICE_V2=true\nGITHUB_API_URL={}\nGITHUB_TOKEN=fake\nGITHUB_REPOSITORY={}\nGITHUB_REF={}\n",
-            env.results_url, env.runtime_token, env.api_url, env.repository, env.git_ref
-        );
+        // Single-quoted, so the file can be sourced by a shell.
+        let vars: String = [
+            ("ACTIONS_RESULTS_URL", env.results_url.as_str()),
+            ("ACTIONS_RUNTIME_TOKEN", &env.runtime_token),
+            ("ACTIONS_CACHE_SERVICE_V2", "true"),
+            ("GITHUB_API_URL", &env.api_url),
+            ("GITHUB_TOKEN", "fake"),
+            ("GITHUB_REPOSITORY", &env.repository),
+            ("GITHUB_REF", &env.git_ref),
+        ]
+        .iter()
+        .map(|(k, v)| format!("{k}='{}'\n", v.replace('\'', r"'\''")))
+        .collect();
         if let Some(path) = &args.env_file {
             write_atomically(path, vars.as_bytes())?;
         }
