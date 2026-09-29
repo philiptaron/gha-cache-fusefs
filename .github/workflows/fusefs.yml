@@ -46,7 +46,7 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
-      - run: nix flake check --print-build-logs
+      - run: nix flake check --print-build-logs --keep-going
 
   fake:
     name: FUSE against the fake cache service

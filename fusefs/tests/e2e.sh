@@ -123,6 +123,10 @@ write_phase() {
   mkdir tarred
   t tar -C tarred -xf "$WORK/tree.tar"
   diff -r "$WORK/tree" tarred/tree || fail "tar -x"
+  if command -v rsync >/dev/null; then
+    t rsync -a "$WORK/tree/" rsynced/
+    diff -r "$WORK/tree" rsynced || fail "rsync -a"
+  fi
   t dd if=/dev/zero of=sparse bs=1 count=1 seek=$((10 << 20)) status=none
   [ "$(stat -c %s sparse)" = $(((10 << 20) + 1)) ] || fail "sparse file size"
   t dd if=big5 of=synced bs=1M conv=fsync status=none
@@ -167,6 +171,10 @@ read_phase() {
   diff -r "$WORK/tree" copied || fail "cp -a copy"
   diff -r "$WORK/tree" tarred/tree || fail "tar copy"
   [ "$(stat -c %Y tarred/tree/README)" = "$(stat -c %Y "$WORK/tree/README")" ] || fail "tar timestamps"
+  if [ -d rsynced ]; then
+    diff -r "$WORK/tree" rsynced || fail "rsync copy"
+    [ "$(find rsynced -name '.*' | wc -l)" = 0 ] || fail "rsync temporary files were uploaded"
+  fi
   [ "$(stat -c %s sparse)" = $(((10 << 20) + 1)) ] || fail "sparse file"
   cmp synced big5 || fail "fsync'd file"
 
