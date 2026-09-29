@@ -281,6 +281,11 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
 
     let mut env = Env::from_process(&args.token_env)?;
     env.check_mode()?;
+    if std::env::var_os("ACTIONS_CACHE_SERVICE_V2").is_none() {
+        tracing::warn!(
+            "ACTIONS_CACHE_SERVICE_V2 is not set; only the v2 cache service (github.com) is supported"
+        );
+    }
     let read_only = args.read_only || !env.cache_mode.writable();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -68,9 +68,12 @@ measured with a probe workflow.
 * Runs whose cache token is read-only (for example, some pull requests from
   forks) are mounted read-only.
 * The cache service's limits apply: the repository's cache quota (10 GB by
-  default), eviction after 7 days without access, and request rate limits.
-  Each request costs ~250 ms, so many small files take a while to upload;
-  uploads run 8 at a time.
+  default) and eviction after 7 days without access. Creating entries is
+  rate limited, too. In practice about 200 new files per ~30 s per
+  repository are allowed; beyond that the daemon waits as instructed
+  (`Retry-After`), so saving thousands of small files takes minutes. Pack
+  them (tar, squashfs, zip) if that matters: one large file is one entry,
+  and reads of it stay lazy.
 
 ## The action
 

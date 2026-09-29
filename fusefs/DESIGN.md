@@ -60,6 +60,13 @@ range past EOF is `416`.
 ranges reached ~52 MB/s. Eight parallel 16 MiB block uploads moved 128 MiB in
 1.6 s.
 
+**Rate limit on creation.** With eight uploads in flight, the service sustained
+20–23 new entries per second. After roughly 200 `CreateCacheEntry` calls in
+about ten seconds, it answered `429` with a `Retry-After` of 30–40 s. The
+budget is per repository: back-to-back jobs share it. Lookups and downloads
+(200 in 46 s) were not limited. A workload of many small files is therefore
+bounded by roughly 200 new files per half minute, whatever the client does.
+
 **REST listing** returns `id, ref, key, version, size_in_bytes, created_at,
 last_accessed_at`. It is immediately consistent and includes only finalized
 entries. `key=` filters by prefix, `ref=` by scope, and `sort=created_at`
@@ -252,6 +259,11 @@ changing it means writing a new entry.
   from 2 MiB up to 64 MiB and prefetches that far ahead, which turns the
   ~250 ms first-byte latency into streaming throughput. Random readers only
   fetch what they touch.
+* **Sibling prefetch.** The first read of a small remote file (≤ 1 MiB) starts
+  background fetches of the other small files in its directory, six at a
+  time. `cp -r`, `diff -r`, and `tar c` over a tree of small files then read
+  mostly local data instead of paying two round trips (URL, then bytes) per
+  file.
 * `FOPEN_KEEP_CACHE` is set only if the inode's content has not changed since
   the previous open, so the kernel page cache stays warm for immutable data
   without ever serving stale bytes.

@@ -526,7 +526,12 @@ impl Vfs {
             let mut st = self.0.st.lock();
             let h = st.handles.get_mut(&fh).ok_or(EBADF)?;
             let ahead = h.readahead(offset, size as u64);
-            (h.content.clone(), ahead)
+            let first_read = !std::mem::replace(&mut h.has_read, true);
+            let (ino, content) = (h.ino, h.content.clone());
+            if first_read && matches!(content, Content::Remote(_)) {
+                self.prefetch_siblings(&mut st, ino);
+            }
+            (content, ahead)
         };
         match content {
             Content::Local(file) => {
@@ -544,6 +549,37 @@ impl Vfs {
                     .map_err(fetch_err)
             }
         }
+    }
+
+    /// Reading one small remote file suggests the rest of its directory is
+    /// next (`cp -r`, `diff -r`, `tar c`): fetch the small siblings in the
+    /// background, so that reading them costs local I/O instead of two
+    /// ~250 ms round trips each. Once per directory, a few at a time.
+    fn prefetch_siblings(&self, st: &mut State, ino: Ino) {
+        let Some(parent) = st.nodes.get(&ino).map(|n| n.parent) else {
+            return;
+        };
+        if !st.prefetched_dirs.insert(parent) {
+            return;
+        }
+        let siblings = st.small_remote_files(parent, PREFETCH_MAX_SIZE, PREFETCH_MAX_FILES);
+        if siblings.len() < 2 {
+            return;
+        }
+        let api = self.0.api.clone();
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            futures_util::stream::iter(siblings)
+                .for_each_concurrent(PREFETCH_CONCURRENCY, |rd| {
+                    let api = api.clone();
+                    async move {
+                        if let Err(e) = rd.ensure(&api, 0, rd.size()).await {
+                            tracing::debug!("prefetch: {e}");
+                        }
+                    }
+                })
+                .await;
+        });
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
@@ -905,6 +941,12 @@ impl Vfs {
 const READAHEAD_MIN: u64 = 2 * CHUNK;
 const READAHEAD_MAX: u64 = 64 * CHUNK;
 
+/// Sibling prefetch: files up to this size, this many per directory, this
+/// many at once (modest, so speculative reads do not provoke rate limits).
+const PREFETCH_MAX_SIZE: u64 = CHUNK;
+const PREFETCH_MAX_FILES: usize = 256;
+const PREFETCH_CONCURRENCY: usize = 6;
+
 impl Handle {
     fn new(ino: Ino, content: Content, writable: bool) -> Handle {
         Handle {
@@ -913,6 +955,7 @@ impl Handle {
             writable,
             next: 0,
             window: 0,
+            has_read: false,
         }
     }
 
