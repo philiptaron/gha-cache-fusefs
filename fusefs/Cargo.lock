@@ -478,6 +478,7 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -487,6 +488,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
 ]
 
 [[package]]

@@ -173,12 +173,19 @@ fn daemonize(log: &Path) -> anyhow::Result<Ready> {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         bail!("pipe: {}", std::io::Error::last_os_error());
     }
+    // Children such as fusermount3 must not inherit the pipe, or the parent
+    // would wait for them too.
+    for fd in fds {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     match unsafe { libc::fork() } {
         -1 => bail!("fork: {}", std::io::Error::last_os_error()),
         0 => {
             unsafe {
                 libc::close(fds[0]);
                 libc::setsid();
+                // Do not keep whatever directory we started in busy.
+                libc::chdir(c"/".as_ptr());
             }
             let log = OpenOptions::new()
                 .create(true)
@@ -237,11 +244,13 @@ fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-fn mount(args: MountArgs, log: &str) -> anyhow::Result<ExitCode> {
-    let state_dir = args
-        .state_dir
-        .clone()
-        .unwrap_or_else(|| default_state_dir(&args.mountpoint));
+fn mount(mut args: MountArgs, log: &str) -> anyhow::Result<ExitCode> {
+    // The daemon changes to /, so relative paths must be resolved first.
+    args.mountpoint = std::path::absolute(&args.mountpoint)?;
+    let state_dir = match &args.state_dir {
+        Some(dir) => std::path::absolute(dir)?,
+        None => default_state_dir(&args.mountpoint),
+    };
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     let mut ready = if args.daemon {
