@@ -5,6 +5,7 @@ pub mod bench;
 pub mod config;
 pub mod data;
 pub mod entry;
+pub mod erofs;
 pub mod fake;
 pub mod index;
 pub mod vfs;
