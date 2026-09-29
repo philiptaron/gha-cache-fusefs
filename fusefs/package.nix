@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  erofs-utils,
 }:
 
 rustPlatform.buildRustPackage {
@@ -18,6 +19,9 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  # fsck.erofs and mkfs.erofs check the EROFS images we write (tests/erofs.rs).
+  nativeCheckInputs = [ erofs-utils ];
 
   # The integration tests talk to an in-process fake cache service on 127.0.0.1.
   __darwinAllowLocalNetworking = true;
