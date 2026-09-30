@@ -282,7 +282,7 @@ fn dir_meta(st: &State, inner: &Inner, full: &str) -> erofs::Meta {
     }
 }
 
-fn meta(mode: u16, mtime: SystemTime) -> erofs::Meta {
+pub(super) fn meta(mode: u16, mtime: SystemTime) -> erofs::Meta {
     erofs::Meta {
         mode,
         uid: unsafe { libc::geteuid() },
@@ -470,9 +470,47 @@ async fn commit(inner: &Arc<Inner>, batch: &Batch) -> Result<Committed, ApiError
 
     // Upload it.
     let size = written.blocks * erofs::BLOCK;
+    let (key, version, id) = upload_image(inner, &sealed, size, || {
+        Version::layer(written.meta_blocks as u32)
+    })
+    .await?;
+    tracing::debug!(
+        "committed layer {key}: {} paths, {size} bytes, entry {id}",
+        out.included.len()
+    );
+    let created = inner.st.lock().index.fresh_created();
+    let entry = Listed {
+        key,
+        version,
+        size,
+        created,
+        accessed: created,
+        id,
+        scope: 0,
+    };
+    let mut metadata = vec![0u8; (written.meta_blocks * erofs::BLOCK) as usize];
+    sealed
+        .read_at(&mut metadata, 0)
+        .map_err(|e| ApiError::Local(format!("reading a layer: {e}")))?;
+    let layer = Layer::parse(entry, written.meta_blocks as u32, &metadata)
+        .map_err(|e| ApiError::Invalid(format!("reading a layer: {e}")))?;
+    out.layer = Some(layer);
+    out.sealed = Some(sealed);
+    Ok(out)
+}
+
+/// Uploads a sealed image of `size` bytes as a new layer or snapshot, and
+/// returns its key, version, and entry id. Every reservation gets a fresh
+/// version from `version`.
+pub(super) async fn upload_image(
+    inner: &Inner,
+    sealed: &Arc<DataFile>,
+    size: u64,
+    version: impl Fn() -> Version,
+) -> Result<(String, String, i64), ApiError> {
     let api = &inner.api;
     for _ in 0..3 {
-        let version = Version::layer(written.meta_blocks as u32);
+        let version = version();
         let key = inner.cfg.volume.layer_key(version.nonce);
         let encoded = version.encode();
         let url = match api.twirp.create(&key, &encoded).await {
@@ -481,33 +519,9 @@ async fn commit(inner: &Arc<Inner>, batch: &Batch) -> Result<Committed, ApiError
             Err(ApiError::AlreadyExists) => continue,
             Err(e) => return Err(e),
         };
-        put(inner, &url, &sealed, size).await?;
+        put(inner, &url, sealed, size).await?;
         match api.twirp.finalize(&key, &encoded, size).await {
-            Ok(id) => {
-                tracing::debug!(
-                    "committed layer {key}: {} paths, {size} bytes, entry {id}",
-                    out.included.len()
-                );
-                let created = inner.st.lock().index.fresh_created();
-                let entry = Listed {
-                    key,
-                    version: encoded,
-                    size,
-                    created,
-                    accessed: created,
-                    id,
-                    scope: 0,
-                };
-                let mut metadata = vec![0u8; (written.meta_blocks * erofs::BLOCK) as usize];
-                sealed
-                    .read_at(&mut metadata, 0)
-                    .map_err(|e| ApiError::Local(format!("reading a layer: {e}")))?;
-                let layer = Layer::parse(entry, written.meta_blocks as u32, &metadata)
-                    .map_err(|e| ApiError::Invalid(format!("reading a layer: {e}")))?;
-                out.layer = Some(layer);
-                out.sealed = Some(sealed);
-                return Ok(out);
-            }
+            Ok(id) => return Ok((key, encoded, id)),
             // The reservation is gone or the size did not match; start over.
             Err(ApiError::NotFound) => continue,
             Err(e) => return Err(e),
@@ -544,17 +558,7 @@ fn image(
         .copied()
         .unwrap_or_else(|| meta(0o755, SystemTime::now()));
     let mut image = Image::new(root);
-    let writer = format!(
-        "gha-cache-fusefs {}{}",
-        env!("CARGO_PKG_VERSION"),
-        match (
-            std::env::var("GITHUB_RUN_ID"),
-            std::env::var("GITHUB_RUN_ATTEMPT")
-        ) {
-            (Ok(id), Ok(attempt)) => format!(", run {id} attempt {attempt}"),
-            _ => String::new(),
-        }
-    );
+    let writer = writer();
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
     let mut slots: HashMap<String, u16> = HashMap::new();
     for &i in members {
@@ -599,27 +603,14 @@ fn image(
                         len,
                         source: Box::new(std::io::Cursor::new(bytes.clone())),
                     },
-                    (None, Some((rd, offset))) => {
-                        let tag = inner.cfg.volume.device_tag(&rd.entry.key).ok_or_else(|| {
-                            erofs::Error::Tree(format!("{}: not ours", rd.entry.key))
-                        })?;
-                        let device = match slots.get(&tag) {
-                            Some(d) => *d,
-                            None => {
-                                let d = image.add_device(erofs::Device {
-                                    tag: tag.clone(),
-                                    blocks: rd.size().div_ceil(erofs::BLOCK),
-                                })?;
-                                slots.insert(tag, d);
-                                d
-                            }
-                        };
-                        FileData::Device {
-                            len,
-                            device,
-                            start: offset / erofs::BLOCK,
-                        }
-                    }
+                    (None, Some((rd, offset))) => reference(
+                        &mut image,
+                        &mut slots,
+                        &inner.cfg.volume,
+                        &rd.entry,
+                        offset,
+                        len,
+                    )?,
                     (None, None) => unreachable!("remote data is inline or a range"),
                 };
                 (NodeKind::File(data), *meta, None)
@@ -654,6 +645,52 @@ fn image(
         image.insert(&path, node)?;
     }
     Ok(image)
+}
+
+/// What a layer's root says about who wrote it (`WRITER_XATTR`).
+pub(super) fn writer() -> String {
+    format!(
+        "gha-cache-fusefs {}{}",
+        env!("CARGO_PKG_VERSION"),
+        match (
+            std::env::var("GITHUB_RUN_ID"),
+            std::env::var("GITHUB_RUN_ATTEMPT")
+        ) {
+            (Ok(id), Ok(attempt)) => format!(", run {id} attempt {attempt}"),
+            _ => String::new(),
+        }
+    )
+}
+
+/// Data of `len` bytes at `offset` in the layer or blob `entry`, through
+/// its device slot, which is added if the image has none yet (LAYERS.md §3).
+pub(super) fn reference(
+    image: &mut erofs::Image,
+    slots: &mut HashMap<String, u16>,
+    volume: &entry::Volume,
+    entry: &Listed,
+    offset: u64,
+    len: u64,
+) -> erofs::Result<erofs::FileData> {
+    let tag = volume
+        .device_tag(&entry.key)
+        .ok_or_else(|| erofs::Error::Tree(format!("{}: not ours", entry.key)))?;
+    let device = match slots.get(&tag) {
+        Some(d) => *d,
+        None => {
+            let d = image.add_device(erofs::Device {
+                tag: tag.clone(),
+                blocks: entry.size.div_ceil(erofs::BLOCK),
+            })?;
+            slots.insert(tag, d);
+            d
+        }
+    };
+    Ok(erofs::FileData::Device {
+        len,
+        device,
+        start: offset / erofs::BLOCK,
+    })
 }
 
 /// What became of a large file's blob.
@@ -1072,9 +1109,9 @@ impl Read for DataReader {
 }
 
 /// Writes a data file from the start, for sealing.
-struct DataWriter<'a> {
-    file: &'a DataFile,
-    pos: u64,
+pub(super) struct DataWriter<'a> {
+    pub file: &'a DataFile,
+    pub pos: u64,
 }
 
 impl std::io::Write for DataWriter<'_> {

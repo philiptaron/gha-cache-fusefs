@@ -1,8 +1,7 @@
 # gha-cache-fusefs: layers
 
-Status: implemented, except snapshots (§8), which are specified. This is
-format 2. It replaces
-format 1's one cache entry per file, which mounts now ignore.
+Status: implemented. This is format 2. It replaces format 1's one cache
+entry per file, which mounts now ignore.
 
 ## 1. Why
 

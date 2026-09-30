@@ -464,6 +464,39 @@ async fn mount(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyhow::R
         per_sec(n, l.elapsed, "files"),
     );
 
+    // A snapshot of them, and the same mount from it.
+    let s = cache
+        .job_with(|c| {
+            c.snapshot_after = 1;
+            c.snapshot_margin = Duration::ZERO;
+        })
+        .await?;
+    let m = Meter::start(s.summary());
+    let summary = s.drain().await;
+    let w = m.stop(&summary);
+    ensure!(
+        summary.snapshots == 1,
+        "no snapshot was written: {summary:?}"
+    );
+    out.push(
+        &w,
+        format!("write a snapshot of the {count} layers (unmount)"),
+        String::new(),
+    );
+    let parts = cache.parts()?;
+    let m = Meter::start(Summary::default());
+    let b = cache.load(parts).await?;
+    let l = m.stop(&b.summary());
+    ensure!(
+        list(&b, ROOT)?.len() == list(&a, ROOT)?.len(),
+        "the snapshot lost files"
+    );
+    out.push(
+        &l,
+        "the same mount, from the snapshot",
+        per_sec(n, l.elapsed, "files"),
+    );
+
     // The same, ten times larger, from memory: the CPU cost alone.
     let big = n * 10;
     let parsed: Vec<Layer> = layers_of(big)?
