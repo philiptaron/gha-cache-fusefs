@@ -15,7 +15,7 @@ use gha_cache_fusefs::config::Env;
 use gha_cache_fusefs::data::DataStore;
 use gha_cache_fusefs::entry::Volume;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer};
-use gha_cache_fusefs::vfs::{Summary, Vfs, VfsConfig};
+use gha_cache_fusefs::vfs::{FsyncMode, Summary, Vfs, VfsConfig};
 
 #[derive(Parser)]
 #[command(version, about = "Mount the GitHub Actions cache as a FUSE filesystem")]
@@ -67,6 +67,10 @@ struct MountArgs {
     /// How long a closed file waits before it is uploaded.
     #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
     settle: Duration,
+    /// What `fsync` waits for: nothing (`local`), or an upload of the file
+    /// (`commit`).
+    #[arg(long, env = "GHA_CACHE_FUSEFS_FSYNC", value_enum, default_value_t = Fsync::Local)]
+    fsync: Fsync,
     /// Minimum interval between re-listings triggered by lookup misses (0 disables).
     #[arg(long, default_value = "15s", value_parser = humantime::parse_duration)]
     refresh: Duration,
@@ -112,6 +116,14 @@ struct FakeArgs {
     /// `hosted` adds the real service's latency, bandwidth, and rate limit.
     #[arg(long, value_enum, default_value_t = Profile::Local)]
     profile: Profile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Fsync {
+    /// Return at once; the file uploads with the next batch.
+    Local,
+    /// Upload the file now, and wait for it.
+    Commit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -380,6 +392,10 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
             .map_err(anyhow::Error::msg)?;
         cfg.read_only = read_only;
         cfg.settle = args.settle;
+        cfg.fsync = match args.fsync {
+            Fsync::Local => FsyncMode::Local,
+            Fsync::Commit => FsyncMode::Commit,
+        };
         cfg.refresh = (!args.refresh.is_zero()).then_some(args.refresh);
         cfg.upload_concurrency = args.upload_concurrency;
         tracing::info!("scopes: {:?}", env.scopes());

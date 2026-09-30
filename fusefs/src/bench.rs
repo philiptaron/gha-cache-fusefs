@@ -17,7 +17,7 @@ use crate::data::DataStore;
 use crate::entry::{Kind, Volume};
 use crate::fake::{FakeConfig, FakeServer};
 use crate::index::{self, Index, Layer, Listed};
-use crate::vfs::{Attr, DirEntry, FileKind, Ino, ROOT, Summary, Vfs, VfsConfig};
+use crate::vfs::{Attr, DirEntry, FileKind, FsyncMode, Ino, ROOT, Summary, Vfs, VfsConfig};
 
 const MAIN: &str = "refs/heads/main";
 /// The size of the kernel's read and write requests.
@@ -540,7 +540,14 @@ async fn throttled(cache: &mut Cache, sizes: &Sizes, out: &mut Out<'_>) -> anyho
 
     let mut writers = Vec::new();
     for _ in 0..WRITERS {
-        writers.push(cache.job_with(|c| c.settle = Duration::ZERO).await?);
+        writers.push(
+            cache
+                .job_with(|c| {
+                    c.settle = Duration::ZERO;
+                    c.fsync = FsyncMode::Commit;
+                })
+                .await?,
+        );
     }
     let other = cache.job().await?;
     let mut handles = Vec::new();

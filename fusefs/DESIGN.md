@@ -269,9 +269,14 @@ accumulate; snapshots, which would let old ones expire, are future work
    indefinitely while mounted; a `429` pauses further creations (but not
    downloads) until `Retry-After`. An ambiguous `Create`/`Finalize` restarts
    with a new nonce. Permanent errors are recorded and reported at unmount.
-5. `fsync` commits the file *now* and waits, even if it is still open for
-   writing. It is the explicit durability point, and makes a layer of its
-   own: programs that sync every file meet the rate limit.
+5. `fsync` returns at once by default (`--fsync local`): the file is on
+   local disk, and it uploads with the next batch, at the latest when the
+   job unmounts, which is the only durability that outlives a CI job. With
+   `--fsync commit`, it commits the file *now* and waits, even if the file
+   is still open for writing. That makes a layer of its own and costs three
+   round trips per call; a program that syncs every file, such as SQLite
+   after each transaction, re-uploads the file each time and meets the
+   rate limit.
 6. **Unmount drains.** Every pending op becomes due immediately, and empty
    directories that exist only locally get a `keep` mark. A rename's
    whiteout goes in the layer of its new name, or a later one, so that a

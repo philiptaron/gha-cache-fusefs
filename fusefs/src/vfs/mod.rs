@@ -120,6 +120,16 @@ pub enum RenameMode {
     NoReplace,
 }
 
+/// What `fsync` waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsyncMode {
+    /// Nothing: the file is on local disk once `write` returns, and is
+    /// uploaded with the next batch, like any other.
+    Local,
+    /// The file's layer: it uploads a batch at once, and waits for it.
+    Commit,
+}
+
 #[derive(Clone, Debug)]
 pub struct VfsConfig {
     pub volume: Volume,
@@ -128,6 +138,7 @@ pub struct VfsConfig {
     pub read_only: bool,
     /// How long a closed file waits before it is uploaded.
     pub settle: Duration,
+    pub fsync: FsyncMode,
     /// Minimum time between refreshes triggered by lookup misses.
     pub refresh: Option<Duration>,
     pub uid: u32,
@@ -146,6 +157,7 @@ impl VfsConfig {
             root: String::new(),
             read_only: false,
             settle: Duration::from_secs(1),
+            fsync: FsyncMode::Local,
             refresh: Some(Duration::from_secs(15)),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -796,11 +808,14 @@ impl Vfs {
         Ok(())
     }
 
-    /// Uploads the file now and waits: the durability point.
+    /// With `FsyncMode::Commit`, uploads the file now and waits.
     pub async fn fsync(&self, fh: u64) -> Result<()> {
         let path = {
             let mut st = self.0.st.lock();
             let ino = st.handles.get(&fh).ok_or(EBADF)?.ino;
+            if self.0.cfg.fsync == FsyncMode::Local {
+                return Ok(());
+            }
             let Ok(f) = st.file(ino) else { return Ok(()) };
             if !f.dirty || !st.node(ino)?.attached {
                 return Ok(());
