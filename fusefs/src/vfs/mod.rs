@@ -837,33 +837,38 @@ impl Vfs {
 
     /// With `FsyncMode::Commit`, uploads the file now and waits.
     pub async fn fsync(&self, fh: u64) -> Result<()> {
-        let path = {
-            let mut st = self.0.st.lock();
+        let ino = {
+            let st = self.0.st.lock();
             let ino = st.handles.get(&fh).ok_or(EBADF)?.ino;
             if self.0.cfg.fsync == FsyncMode::Local {
                 return Ok(());
             }
-            let Ok(f) = st.file(ino) else { return Ok(()) };
-            if !f.dirty || !st.node(ino)?.attached {
-                return Ok(());
-            }
-            let path = st.path(ino);
-            st.overlay.get_mut(&path).ok_or(EIO)?.force = true;
-            st.schedule(&path, Some(Instant::now()));
-            path
+            ino
         };
-        self.0.wake.notify_one();
         loop {
             let notified = self.0.done.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
-                let st = self.0.st.lock();
-                match st.overlay.get(&path) {
-                    None => return Ok(()),
-                    Some(p) if p.failed => return Err(EIO),
-                    Some(p) if !matches!(p.op, PendingOp::Put(_)) => return Ok(()),
-                    _ => {}
+                let mut st = self.0.st.lock();
+                let Ok(f) = st.file(ino) else { return Ok(()) };
+                if !f.dirty || !st.node(ino)?.attached {
+                    return Ok(());
+                }
+                let path = st.path(ino);
+                let p = st.overlay.get_mut(&path).ok_or(EIO)?;
+                if p.failed {
+                    return Err(EIO);
+                }
+                if p.op != PendingOp::Put(ino) {
+                    return Ok(());
+                }
+                // Due now, open or not: again after each attempt, in case
+                // the file changed while it was in flight.
+                if p.inflight.is_none() {
+                    p.force = true;
+                    st.schedule(&path, Some(Instant::now()));
+                    self.0.wake.notify_one();
                 }
             }
             notified.await;
