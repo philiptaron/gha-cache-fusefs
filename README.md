@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: philiptaron/gha-cache-fusefs/mount@main
+      - uses: philiptaron/gha-cache-fusefs/mount@v0.1.0
         with:
           path: /mnt/cache
       - run: |
@@ -25,7 +25,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: philiptaron/gha-cache-fusefs/mount@main
+      - uses: philiptaron/gha-cache-fusefs/mount@v0.1.0
         with:
           path: /mnt/cache
           read-only: true
@@ -181,27 +181,10 @@ They share the repository's cache storage and nothing else.
 | `fail-on-error` | `true` | fail the job if changes could not be saved |
 | `log` | `info` | daemon log filter |
 
-## Without the action
-
-The runtime token the cache needs is only exported to actions, not to
-`run:` steps. Export it yourself and drive the binary:
-
-```yaml
-- uses: actions/github-script@v9
-  with:
-    script: |
-      core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
-      core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL)
-- run: |
-    nix build github:philiptaron/gha-cache-fusefs#static
-    ./result/bin/gha-cache-fusefs mount /mnt/cache --daemon
-    ...
-    ./result/bin/gha-cache-fusefs unmount /mnt/cache   # waits for uploads
-  env:
-    GITHUB_TOKEN: ${{ github.token }}
-```
-
-`gha-cache-fusefs mount --help` lists the options.
+Each [release](https://github.com/philiptaron/gha-cache-fusefs/releases)
+carries static binaries for x86_64 and aarch64 Linux, and the action
+downloads the one for its ref: `@v0.1.0` gets v0.1.0's, and `@main` gets
+the rolling `main-latest` prerelease's. Nothing is built on the runner.
 
 ## Development
 

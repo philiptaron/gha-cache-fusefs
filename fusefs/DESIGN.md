@@ -368,7 +368,7 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
     actions: read
     contents: read
   steps:
-    - uses: philiptaron/gha-cache-fusefs/mount@main
+    - uses: philiptaron/gha-cache-fusefs/mount@v0.1.0
       with:
         path: /mnt/cache
     - run: cp -r build/ /mnt/cache/build-${{ github.sha }}
