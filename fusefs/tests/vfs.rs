@@ -1821,6 +1821,25 @@ async fn an_empty_write_past_the_end_changes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_sees_what_this_mount_writes_after_a_commit() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "log", b"old");
+    drained(&a).await;
+
+    let j = job(&server, MAIN).await;
+    let f = lookup(&j, "log").await.unwrap();
+    let (reader, _) = j.open(f.ino, libc::O_RDONLY).await.unwrap();
+    // Truncating the remote file gives it new local content, which the
+    // reader follows.
+    let (writer, _) = j.open(f.ino, libc::O_WRONLY | libc::O_TRUNC).await.unwrap();
+    j.write(writer, 0, b"new!").unwrap();
+    j.release(writer).unwrap();
+    assert_eq!(j.read(reader, 0, 100).await.unwrap(), b"new!");
+    j.release(reader).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_renamed_directory_stays_gone_while_a_file_in_it_is_open() {
     let server = server().await;
     let a = job(&server, MAIN).await;

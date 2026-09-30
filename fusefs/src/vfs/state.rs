@@ -835,6 +835,7 @@ impl State {
         let attached = self.node(ino)?.attached;
         let due = Some(Instant::now() + cfg.settle);
         let f = self.file_mut(ino)?;
+        let mut replaced = false;
         let content = match f.content.clone() {
             Content::Local(file) => {
                 if trunc {
@@ -858,6 +859,7 @@ impl State {
                 f.content = Content::Local(file.clone());
                 f.size = 0;
                 f.generation += 1;
+                replaced = true;
                 if trunc {
                     f.committed = None;
                     f.dirty = true;
@@ -872,6 +874,9 @@ impl State {
             f.writers += 1;
         }
         let writers = f.writers;
+        if replaced {
+            self.follow(ino, &content);
+        }
         if trunc {
             self.bump_epoch(ino);
         }
@@ -895,10 +900,26 @@ impl State {
             Content::Remote(cur) if Arc::ptr_eq(cur, rf) => {
                 f.size = rf.size();
                 f.committed = Some(rf.clone());
-                f.content = Content::Local(local);
+                f.content = Content::Local(local.clone());
+                self.follow(ino, &Content::Local(local));
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Open handles of a file follow the content this mount gives it, as
+    /// POSIX has it, and see its changes. (Only a newer version from a
+    /// refresh leaves them with the one they opened.)
+    fn follow(&mut self, ino: Ino, content: &Content) {
+        for h in self.handles.values_mut().filter(|h| h.ino == ino) {
+            if let Content::Remote(rf) = &h.content {
+                rf.unpin();
+            }
+            if let Content::Remote(rf) = content {
+                rf.pin();
+            }
+            h.content = content.clone();
         }
     }
 
