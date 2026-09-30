@@ -204,12 +204,14 @@ whiteout commit together. The sealed file then serves as the mount's cache
 of the layer, so reading back what it wrote needs no download.
 
 The rest of the write path stays as it is. Writes stay local until a batch
-is due, the settle delay still folds write-then-rename, `fsync` makes the
-file due at once, and unmount drains everything into as few layers as the
-caps allow. While a layer uploads, and while a mount is rate limited,
-whatever becomes due joins the next batch, so batches grow exactly when
-they should. The flip side is `fsync`: a program that syncs after every
-file makes a layer per file, and meets the rate limit as format 1 did.
+is due, the settle delay still folds write-then-rename, and unmount drains
+everything into as few layers as the caps allow. While a layer uploads, and
+while a mount is rate limited, whatever becomes due joins the next batch,
+so batches grow exactly when they should. `fsync` does not wait for the
+network unless the mount asks it to (`--fsync commit`); then it makes the
+file due at once and waits for its layer, and a program that syncs after
+every file makes a layer per file, and meets the rate limit as format 1
+did.
 
 ## 6. Reading layers
 

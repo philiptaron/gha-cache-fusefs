@@ -12,7 +12,7 @@ use gha_cache_fusefs::erofs;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer, RateLimit};
 use gha_cache_fusefs::index;
 use gha_cache_fusefs::vfs::{
-    Attr, Errno, FileKind, Ino, ROOT, RenameMode, SetAttr, SetTime, Vfs, VfsConfig,
+    Attr, Errno, FileKind, FsyncMode, Ino, ROOT, RenameMode, SetAttr, SetTime, Vfs, VfsConfig,
 };
 
 const MAIN: &str = "refs/heads/main";
@@ -484,7 +484,7 @@ async fn rate_limited_creations_wait_and_are_reported() {
     })
     .await
     .unwrap();
-    let a = job(&server, MAIN).await;
+    let a = job_with(&server, MAIN, |c| c.fsync = FsyncMode::Commit).await;
     // Each fsync commits a layer of its own.
     for i in 0..2 {
         let (_, fh) = a
@@ -651,7 +651,11 @@ async fn blobs_nothing_reads_are_kept_alive() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fsync_commits_before_close() {
     let server = server().await;
-    let a = job_with(&server, MAIN, |c| c.settle = Duration::from_secs(3600)).await;
+    let a = job_with(&server, MAIN, |c| {
+        c.settle = Duration::from_secs(3600);
+        c.fsync = FsyncMode::Commit;
+    })
+    .await;
     let (_, fh) = a.create(ROOT, "log", 0o644, libc::O_WRONLY).unwrap();
     a.write(fh, 0, b"first").unwrap();
     a.fsync(fh).await.unwrap();
@@ -663,6 +667,26 @@ async fn fsync_commits_before_close() {
     drained(&a).await;
     let c = job(&server, MAIN).await;
     assert_eq!(cat(&c, "log").await, b"first second");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsync_is_local_by_default() {
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let before = a.summary().requests;
+    for i in 0..3 {
+        let (_, fh) = a
+            .create(ROOT, &format!("f{i}"), 0o644, libc::O_WRONLY)
+            .unwrap();
+        a.write(fh, 0, b"x").unwrap();
+        a.fsync(fh).await.unwrap();
+        a.release(fh).unwrap();
+    }
+    assert_eq!(a.summary().requests, before);
+    assert_eq!(layers(&server), 0);
+    // They all upload at unmount, in one layer.
+    let summary = a.drain().await;
+    assert_eq!((summary.uploaded_files, summary.layers), (3, 1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1047,7 +1071,7 @@ async fn a_file_whose_blob_is_gone_is_gone() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn changes_made_while_sealing_wait_for_the_next_layer() {
     let server = server().await;
-    let a = job(&server, MAIN).await;
+    let a = job_with(&server, MAIN, |c| c.fsync = FsyncMode::Commit).await;
     // A file that keeps changing is committed as it was, and then as it is.
     let (_, fh) = a.create(ROOT, "log", 0o644, libc::O_WRONLY).unwrap();
     for i in 0..50u64 {

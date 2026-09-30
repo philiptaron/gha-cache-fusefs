@@ -112,14 +112,15 @@ async function main() {
   setState('binary', bin);
   setState('state-dir', stateDir);
   setOutput('state-dir', stateDir);
-  // The volume and root go in the environment rather than as flags: a binary
-  // from before volumes existed, such as an older release, ignores them
-  // instead of refusing to start.
+  // The volume, root, and fsync mode go in the environment rather than as
+  // flags: a binary from before they existed, such as an older release,
+  // ignores them instead of refusing to start.
   const env = {
     ...process.env,
     GITHUB_TOKEN: input('token'),
     GHA_CACHE_FUSEFS_VOLUME: input('volume', 'default'),
     GHA_CACHE_FUSEFS_ROOT: input('root', ''),
+    GHA_CACHE_FUSEFS_FSYNC: input('fsync', 'local'),
   };
   const r = run(bin, args, { env });
   if (r.status !== 0) throw new Error(`mounting failed (exit ${r.status}); see ${stateDir}/daemon.log`);

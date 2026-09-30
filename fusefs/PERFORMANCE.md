@@ -15,10 +15,11 @@ they led to carry over.
 
 * **Small files no longer wait on the rate limit.** Saving 1,000 files of
   4 KiB takes 1.1 s in the model and one creation, where format 1 took 204 s
-  and 1,000 creations. `rm -r` of them takes 0.8 s instead of 204 s. Only
-  programs that `fsync` every file still make an entry per file, and one
-  mount makes at most about 1.3 a second, since layers upload one at a time;
-  it takes several such jobs at once to meet the limit (§4.1).
+  and 1,000 creations. `rm -r` of them takes 0.8 s instead of 204 s.
+  `fsync` returns at once by default. With `--fsync commit`, programs that
+  `fsync` every file still make an entry per file, each waiting three round
+  trips, about 1.3 a second; it takes several such jobs at once to meet the
+  limit (§4.1).
 * **Reading small files costs bandwidth, not round trips.** `cp -r` of the
   1,000 files takes 1.2 s and 4 requests, where format 1 took 91 s and
   2,000: a directory's files are one range of a layer, and files of up to
@@ -82,7 +83,7 @@ In format 2, where *L* is the number of layers and blobs:
 | later reads | a ranged GET per missing run of ≤ 8 MiB; readahead grows to 64 MiB | – |
 | a batch of changes: files ≤ 8 MiB, symlinks, directories, deletions | `CreateCacheEntry`, `Put Blob` or 8 MiB blocks, `FinalizeCacheEntryUpload` | 1 |
 | a file over 8 MiB | the same, for its blob, unless a readable scope has it | 1 more |
-| `fsync` | a batch of its own, if nothing else is due | 1 |
+| `fsync` | nothing; with `--fsync commit`, a batch of its own if nothing else is due | 0 (1) |
 | `mv` of an uncached remote file over 1 KiB | `EXDEV`, so `mv` copies: download, then a layer | 1 |
 
 Several consequences follow.
@@ -160,8 +161,8 @@ Against format 1 (§4.3):
   creation, an upload, and a finalization, 0.75 s in all. Large reads are
   unchanged: they are ranges of the blob, as they were ranges of the file's
   own entry.
-* **The rate limit takes several jobs now.** One job that writes and
-  `fsync`s one file at a time makes a layer per file, one after another,
+* **The rate limit takes several jobs now.** With `--fsync commit`, one job
+  that writes and `fsync`s one file at a time makes a layer per file, one after another,
   about 1.3 a second; the quick-scale run of 250 files never met the limit
   in 180 s. Six such jobs at once met it after 198 layers in 25 s. As
   before, a throttled job's reads do not wait. The 429 landed in another of
@@ -371,11 +372,15 @@ they would remove.
   lets old layers go, so mount time and REST cost grow with a volume's
   history. A snapshot holds the merged tree of its scope, and mounts read
   only the layers it does not cover.
-* **Pipeline layers.** Layers finalize in order, because that is the order
-  they stack in, but nothing stops the next one from being created and
-  uploaded while the previous one finalizes. That would take one mount from
-  about 1.3 layers a second to about 4, which is what a program that
-  `fsync`s every file needs (§4.1).
+* **Not pipelining layers.** Creating and uploading the next layer while
+  the previous one finalizes looked like it would take a mount from 1.3
+  layers a second to about 4. It would not help the program it was for: an
+  `fsync` in `commit` mode waits for its layer, so a program that syncs
+  every file has one file due at a time, and each sync costs three round
+  trips however the uploads overlap. Several programs syncing at once
+  already share the next batch; overlapping would only make batches
+  smaller and spend more creations. `fsync` in the default `local` mode
+  waits for nothing instead.
 * **Skip unchanged uploads.** A file whose digest and attributes equal what
   the view already shows needs no upload. That covers `cp -a`, `tar -x`,
   and `rsync` of mostly unchanged trees; for large files, the blob is
@@ -397,7 +402,7 @@ service, or its own volume of the real cache.
 | `large` | write and upload one large file; read it sequentially cold, then cached; random 4 KiB reads cold |
 | `small` | write and upload a tree of small files; mount it; `cp -r`, `ls -lR`, and `rm -r` it, each in a new job |
 | `mount` | mount a volume of many files in layers of 1,000; build ten times as large a tree from layers in memory (fake service only) |
-| `throttled` | six jobs write and `fsync` files one at a time, a layer each, into the rate limit; meanwhile, one of them and another job each read a small file |
+| `throttled` | six jobs with `--fsync commit` write and `fsync` files one at a time, a layer each, into the rate limit; meanwhile, one of them and another job each read a small file |
 
 The model (`FakeConfig::hosted`) adds these, and only these:
 

@@ -25,6 +25,10 @@ inputs:
     description: 'How long a closed file waits before it is uploaded'
     default: '1s'
     required: false
+  fsync:
+    description: 'What fsync waits for: `local` returns at once, and the file uploads with the next batch; `commit` uploads the file and waits'
+    default: 'local'
+    required: false
   cache-size-mb:
     description: 'Local disk budget for cached remote content, in MiB'
     default: '8192'
