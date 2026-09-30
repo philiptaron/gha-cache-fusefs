@@ -1778,3 +1778,16 @@ async fn covered_layers_live_while_visible_files_need_them() {
         assert_eq!(used, holds_kept, "{key}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_write_past_the_end_changes_nothing() {
+    let server = server().await;
+    let a = patient_job(&server, MAIN).await;
+    let (attr, fh) = a.create(ROOT, "f", 0o644, libc::O_WRONLY).unwrap();
+    a.write(fh, 0, b"abc").unwrap();
+    assert_eq!(a.write(fh, 100, b"").unwrap(), 0);
+    a.release(fh).unwrap();
+    assert_eq!(a.getattr(attr.ino).unwrap().size, 3);
+    drained(&a).await;
+    assert_eq!(cat(&job(&server, MAIN).await.vfs, "f").await, b"abc");
+}

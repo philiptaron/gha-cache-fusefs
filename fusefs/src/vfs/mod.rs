@@ -793,6 +793,11 @@ impl Vfs {
             let (ino, Content::Local(file)) = (h.ino, h.content.clone()) else {
                 return Err(EBADF);
             };
+            // As write(2): nothing at all, not even past the end, which
+            // would claim bytes the file does not have.
+            if data.is_empty() {
+                return Ok(0);
+            }
             let f = st.file_mut(ino)?;
             f.writes_inflight += 1;
             f.generation += 1;
