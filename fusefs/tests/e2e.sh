@@ -114,6 +114,12 @@ write_phase() {
   mkdir tmpdir
   echo x >tmpdir/f
   mv tmpdir moveddir
+  mkdir saveddir
+  echo y >saveddir/f
+  sleep 2 # let it be uploaded, so the rename moves a committed directory
+  ino=$(stat -c %i saveddir)
+  t mv saveddir saveddir-moved
+  [ "$(stat -c %i saveddir-moved)" = "$ino" ] || fail "mv of a saved directory copied it"
 
   log "cp -a, tar, dd, mksquashfs"
   make_tree "$WORK/tree"
@@ -195,6 +201,9 @@ read_phase() {
   fi
 
   log "changing files that only exist remotely"
+  ino=$(stat -c %i tarred) # all of it was read above, so it is cached
+  t mv tarred tarred-moved
+  [ "$(stat -c %i tarred-moved)" = "$ino" ] || fail "mv of a cached remote directory copied it"
   t mv big5 big5-moved # not cached here: EXDEV, so mv copies
   same big5-moved big5 $((5 << 20))
   [ ! -e big5 ] || fail "mv left its source behind"
@@ -211,6 +220,11 @@ verify_phase() {
   log "changes survive"
   [ "$(cat hello.txt)" = "$(printf 'hello, world\nmore')" ] || fail "appending to a remote file"
   [ ! -e big5 ] && [ -f big5-moved ] || fail "mv of a remote file"
+  [ ! -e tarred ] || fail "mv of a remote directory left its source behind"
+  make_tree "$WORK/tree"
+  diff -r "$WORK/tree" tarred-moved/tree || fail "mv of a remote directory"
+  [ "$(stat -c %Y tarred-moved/tree/README)" = "$(stat -c %Y "$WORK/tree/README")" ] || fail "mv of a remote directory: timestamps"
+  [ "$(cat saveddir-moved/f)" = y ] && [ ! -e saveddir ] || fail "mv of a saved directory"
   [ "$(stat -c %a run.sh)" = 644 ] || fail "chmod of a remote file"
   [ ! -e copied ] || fail "rm -r"
   [ ! -e emptydir ] || fail rmdir

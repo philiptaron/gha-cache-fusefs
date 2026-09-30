@@ -517,20 +517,6 @@ impl Index {
         matches!(self.view.get(path), Some(Node::Dir { keep: true, .. }))
     }
 
-    /// Whether anything is at or below `path` (other than the root).
-    pub fn any_within(&self, path: &str) -> bool {
-        if path.is_empty() {
-            return self.view.len() > 1;
-        }
-        let prefix = format!("{path}/");
-        self.view.contains_key(path)
-            || self
-                .view
-                .range(prefix.clone()..)
-                .next()
-                .is_some_and(|(k, _)| k.starts_with(&prefix))
-    }
-
     /// Every path in the view, sorted, parents first.
     pub fn paths(&self) -> impl Iterator<Item = &String> {
         self.view.keys()
@@ -1073,9 +1059,8 @@ mod tests {
     }
 
     #[test]
-    fn what_is_within() {
+    fn what_is_a_leaf() {
         let mut ix = index();
-        assert!(!ix.any_within(""));
         ix.insert_layer(layer(
             1,
             0,
@@ -1084,10 +1069,6 @@ mod tests {
             &[],
         ));
         ix.restack();
-        assert!(ix.any_within(""));
-        assert!(ix.any_within("a"));
-        assert!(ix.any_within("a/b"));
-        assert!(!ix.any_within("a/c"));
         assert!(ix.leaf_at("a/b"));
         assert!(!ix.leaf_at("a"));
     }
