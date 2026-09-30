@@ -838,6 +838,34 @@ async fn fsync_commits_before_close() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsync_of_a_file_opened_while_it_commits() {
+    let server = FakeServer::start(FakeConfig {
+        latency: Duration::from_millis(100),
+        ..FakeConfig::default()
+    })
+    .await
+    .unwrap();
+    let a = job_with(&server, MAIN, |c| {
+        c.settle = Duration::ZERO;
+        c.fsync = FsyncMode::Commit;
+    })
+    .await;
+    let f = write_file(&a, ROOT, "log", b"");
+    // Its layer is on its way while the file is opened again.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (fh, _) = a.open(f, libc::O_WRONLY).await.unwrap();
+    a.fsync(fh).await.unwrap();
+    assert_eq!(layers(&server), 1);
+    a.write(fh, 0, b"synced").unwrap();
+    a.fsync(fh).await.unwrap();
+    assert_eq!(layers(&server), 2);
+    let b = job(&server, MAIN).await;
+    assert_eq!(cat(&b, "log").await, b"synced");
+    a.release(fh).unwrap();
+    drained(&a).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fsync_is_local_by_default() {
     let server = server().await;
     let a = patient_job(&server, MAIN).await;

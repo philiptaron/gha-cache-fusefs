@@ -306,7 +306,13 @@ fn examine(st: &State, inner: &Inner, path: &str) -> Next {
             match &node.body {
                 Body::File(f) => {
                     if !f.dirty {
-                        return Next::Stale;
+                        // Open for writing, it keeps the op for its writes;
+                        // closing it clears it.
+                        return if f.writers > 0 {
+                            Next::Idle
+                        } else {
+                            Next::Stale
+                        };
                     }
                     if f.writes_inflight > 0 {
                         return Next::Later(WRITE_LANDING);
@@ -999,18 +1005,21 @@ fn finish(inner: &Arc<Inner>, batch: Batch, result: Result<Committed, ApiError>)
                     Some(ViewNode::File(f)) if ours(f.id) => Some(st.remote_file(&inner.store, f)),
                     _ => None,
                 };
+                // A file opened for writing while this was in flight is
+                // clean, but keeps its op: its writes will need it, and
+                // closing it clears it.
                 let clean = match st.nodes.get_mut(ino).map(|n| &mut n.body) {
                     Some(Body::File(f)) if f.generation == *generation => {
                         f.dirty = false;
                         f.committed = committed;
-                        true
+                        Some(f.writers == 0)
                     }
-                    _ => false,
+                    _ => None,
                 };
-                if clean {
+                if clean.is_some() {
                     st.make_evictable(*ino);
                 }
-                clean
+                clean == Some(true)
             }
             What::Moved {
                 ino, generation, ..
@@ -1026,7 +1035,7 @@ fn finish(inner: &Arc<Inner>, batch: Batch, result: Result<Committed, ApiError>)
                         if let (Some(rf), Content::Remote(_)) = (committed, &f.content) {
                             f.content = Content::Remote(rf);
                         }
-                        true
+                        f.writers == 0
                     }
                     _ => false,
                 }
