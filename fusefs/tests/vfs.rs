@@ -342,16 +342,15 @@ async fn renaming_committed_and_remote_files() {
     assert_eq!(cat(&c, "g").await, content);
     assert_eq!(cat(&c, "small").await, b"inline");
 
-    // Not cached: moving it would mean downloading it, so the kernel is told
-    // to copy instead (mv does this transparently).
+    // Not cached: the new layer refers to the data where it is.
     let d = job(&server, MAIN).await;
     lookup(&d, "g").await.unwrap();
-    assert_eq!(
-        d.rename(ROOT, "g", ROOT, "h", RenameMode::Replace)
-            .await
-            .unwrap_err(),
-        Errno(libc::EXDEV)
-    );
+    d.rename(ROOT, "g", ROOT, "h", RenameMode::Replace)
+        .await
+        .unwrap();
+    d.rename(ROOT, "h", ROOT, "g", RenameMode::Replace)
+        .await
+        .unwrap();
     write_file(&d, ROOT, "x", b"1");
     assert_eq!(
         d.rename(ROOT, "x", ROOT, "g", RenameMode::NoReplace)
@@ -464,15 +463,112 @@ async fn renaming_a_committed_directory() {
     assert!(ls_path(&c, "e/sub/empty").await.is_empty());
     assert_eq!(lookup(&c, "e").await.unwrap().perm, 0o750);
     assert_eq!(lookup(&c, "e/sub/empty").await.unwrap().perm, 0o700);
+}
 
-    // A file that is not cached would have to be downloaded, so mv copies.
-    let d = job(&server, MAIN).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_remote_files_downloads_nothing() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o755).unwrap();
+    let (small, large) = (noise(5000, 5), noise(9 << 20, 6));
+    write_file(&a, d.ino, "small", &small);
+    write_file(&a, d.ino, "large", &large);
+    write_file(&a, d.ino, "tiny", b"inline");
+    write_file(&a, ROOT, "alone", &small);
+    drained(&a).await;
+
+    // Nothing is cached here: the new layer refers to the data in the old
+    // layer and the blob.
+    let b = job(&server, MAIN).await;
+    let mounted = b.summary().requests;
+    b.rename(ROOT, "d", ROOT, "e", RenameMode::Replace)
+        .await
+        .unwrap();
+    b.rename(ROOT, "alone", ROOT, "moved", RenameMode::Replace)
+        .await
+        .unwrap();
+    let summary = b.drain().await;
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!((summary.layers, summary.blobs), (1, 0));
+    assert_eq!(summary.download_requests, 0, "{summary:?}");
+    // Creating, uploading, and finalizing the layer.
+    let r = summary.requests;
     assert_eq!(
-        d.rename(ROOT, "e", ROOT, "f", RenameMode::Replace)
-            .await
-            .unwrap_err(),
-        Errno(libc::EXDEV)
+        (
+            r.cache_service - mounted.cache_service,
+            r.blob - mounted.blob
+        ),
+        (2, 1),
+        "{summary:?}"
     );
+    let smallest = entries(&server, "layer")
+        .iter()
+        .map(|(_, size)| *size)
+        .min();
+    assert!(smallest.unwrap() <= 16 << 10, "metadata only");
+
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls(&c, ROOT), ["e", "moved"]);
+    assert_eq!(cat(&c, "e/small").await, small);
+    assert_eq!(cat(&c, "e/large").await, large);
+    assert_eq!(cat(&c, "e/tiny").await, b"inline");
+    assert_eq!(cat(&c, "moved").await, small);
+
+    // Moving it again refers to the same data, not to the layer that moved
+    // it first.
+    c.rename(ROOT, "e", ROOT, "f", RenameMode::Replace)
+        .await
+        .unwrap();
+    drained(&c).await;
+    let dd = job(&server, MAIN).await;
+    assert_eq!(cat(&dd, "f/small").await, small);
+    assert_eq!(cat(&dd, "f/large").await, large);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moved_file_whose_layer_is_gone_is_gone() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "f", &noise(5000, 7));
+    drained(&a).await;
+    let first = entries(&server, "layer").remove(0).0;
+    let b = job(&server, MAIN).await;
+    b.rename(ROOT, "f", ROOT, "g", RenameMode::Replace)
+        .await
+        .unwrap();
+    write_file(&b, ROOT, "other", b"still here");
+    drained(&b).await;
+    server.remove(&first, MAIN);
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls(&c, ROOT), ["other"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chmod_of_a_remote_file_downloads_nothing() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "run.sh", &noise(5000, 8));
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    let f = lookup(&b, "run.sh").await.unwrap();
+    let when = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    b.setattr(
+        f.ino,
+        None,
+        SetAttr {
+            mode: Some(0o755),
+            mtime: Some(SetTime::At(when)),
+            ..SetAttr::default()
+        },
+    )
+    .await
+    .unwrap();
+    let summary = b.drain().await;
+    assert_eq!(summary.download_requests, 0, "{summary:?}");
+    let c = job(&server, MAIN).await;
+    let f = lookup(&c, "run.sh").await.unwrap();
+    assert_eq!((f.perm, f.mtime), (0o755, when));
+    assert_eq!(cat(&c, "run.sh").await, noise(5000, 8));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1196,24 +1292,43 @@ async fn layers_pass_fsck() {
     )
     .await
     .unwrap();
+    // Moved files refer to the first layer, and to the blob.
+    for name in ["blocks", "blob"] {
+        b.rename(
+            d.ino,
+            name,
+            d.ino,
+            &format!("moved-{name}"),
+            RenameMode::Replace,
+        )
+        .await
+        .unwrap();
+    }
     drained(&b).await;
 
+    // Each device is a file of its own, named by its tag.
     let dir = tempfile::tempdir().unwrap();
-    let blob_path = dir.path().join("blob");
+    let device = |tag: &str| dir.path().join(tag.replace('/', "-"));
     let (blob, _) = entries(&server, "blob").remove(0);
-    std::fs::write(&blob_path, server.data(&blob, MAIN).unwrap()).unwrap();
+    let sha = blob.rsplit('/').next().unwrap();
+    std::fs::write(device(sha), server.data(&blob, MAIN).unwrap()).unwrap();
     let layers = entries(&server, "layer");
     assert_eq!(layers.len(), 2);
-    for (i, (key, _)) in layers.iter().enumerate() {
+    for (key, _) in &layers {
+        let tag = format!("layer/{}", key.rsplit('/').next().unwrap());
+        std::fs::write(device(&tag), server.data(key, MAIN).unwrap()).unwrap();
+    }
+    let mut layer_refs = 0;
+    for (key, _) in &layers {
         let image = server.data(key, MAIN).unwrap();
         let listing = erofs::read(&image).unwrap();
-        let path = dir.path().join(format!("layer{i}"));
-        std::fs::write(&path, &image).unwrap();
         let mut cmd = Command::new(&fsck);
         for (tag, _) in &listing.devices {
-            assert_eq!(blob.rsplit('/').next(), Some(tag.as_str()));
-            cmd.arg(format!("--device={}", blob_path.display()));
+            assert!(tag == sha || tag.starts_with("layer/"), "{tag}");
+            layer_refs += usize::from(tag.starts_with("layer/"));
+            cmd.arg(format!("--device={}", device(tag).display()));
         }
+        let path = device(&format!("layer/{}", key.rsplit('/').next().unwrap()));
         let out = cmd.arg(&path).output().unwrap();
         assert!(
             out.status.success(),
@@ -1222,6 +1337,7 @@ async fn layers_pass_fsck() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    assert_eq!(layer_refs, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

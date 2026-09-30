@@ -121,12 +121,6 @@ pub(super) struct Pending {
     pub failed: bool,
 }
 
-pub(super) enum RenameNeeds {
-    /// These files' remote content must be made local first: the source,
-    /// or the files below it.
-    Copy(Vec<(Ino, Arc<RemoteFile>)>),
-}
-
 pub(super) struct State {
     pub nodes: HashMap<Ino, Node>,
     next_ino: Ino,
@@ -960,7 +954,7 @@ impl State {
         newname: &str,
         mode: RenameMode,
         due: Option<Instant>,
-    ) -> Result<Option<RenameNeeds>> {
+    ) -> Result<()> {
         self.dir(parent)?;
         self.dir(newparent)?;
         if !valid_component(newname) {
@@ -968,7 +962,7 @@ impl State {
         }
         let src = self.child(parent, name).ok_or(ENOENT)?;
         if parent == newparent && name == newname {
-            return Ok(None);
+            return Ok(());
         }
         let dst = self.child(newparent, newname);
         if dst.is_some() && mode == RenameMode::NoReplace {
@@ -989,19 +983,6 @@ impl State {
                 return Err(EINVAL);
             }
             let tree = self.tree(src);
-            let remote: Vec<(Ino, Arc<RemoteFile>)> = tree
-                .iter()
-                .filter_map(|(ino, _)| match &self.nodes[ino].body {
-                    Body::File(File {
-                        content: Content::Remote(rf),
-                        ..
-                    }) => Some((*ino, rf.clone())),
-                    _ => None,
-                })
-                .collect();
-            if !remote.is_empty() {
-                return Ok(Some(RenameNeeds::Copy(remote)));
-            }
             if let Some(d) = dst {
                 self.detach(d);
                 self.retire(cfg, &new_path, None, due);
@@ -1009,9 +990,9 @@ impl State {
             self.move_node(src, newparent, newname);
             // Everything in the directory moves with it: what is pending
             // keeps its due time, and what is committed is committed again
-            // under its new name, with its content (now local) and a keep
-            // mark for each directory. Each old name is removed once its new
-            // name has landed.
+            // under its new name, referring to the data it has (LAYERS.md
+            // §3), with a keep mark for each directory. Each old name is
+            // removed once its new name has landed.
             for (ino, suffix) in tree {
                 let (old, new) = (format!("{old_path}{suffix}"), format!("{new_path}{suffix}"));
                 let pending = self
@@ -1041,7 +1022,7 @@ impl State {
                 self.retire(cfg, &old, Some(ino), due);
             }
             self.pin(parent);
-            return Ok(None);
+            return Ok(());
         }
 
         if let Some(d) = dst {
@@ -1049,13 +1030,8 @@ impl State {
                 return Err(EISDIR);
             }
         }
-        if let Body::File(File {
-            content: Content::Remote(rf),
-            ..
-        }) = &self.node(src)?.body
-        {
-            return Ok(Some(RenameNeeds::Copy(vec![(src, rf.clone())])));
-        }
+        // A remote file is committed again under its new name, referring to
+        // the data it has.
         if let Some(d) = dst {
             self.detach(d);
         }
@@ -1080,7 +1056,7 @@ impl State {
         );
         self.retire(cfg, &old_path, Some(src), due);
         self.pin(parent);
-        Ok(None)
+        Ok(())
     }
 
     // ---- unmount ----------------------------------------------------------

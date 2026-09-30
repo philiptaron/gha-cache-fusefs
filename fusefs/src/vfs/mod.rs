@@ -51,7 +51,6 @@ const ENOTEMPTY: Errno = Errno(libc::ENOTEMPTY);
 const EINVAL: Errno = Errno(libc::EINVAL);
 const EIO: Errno = Errno(libc::EIO);
 const EROFS: Errno = Errno(libc::EROFS);
-const EXDEV: Errno = Errno(libc::EXDEV);
 const EBADF: Errno = Errno(libc::EBADF);
 const ENAMETOOLONG: Errno = Errno(libc::ENAMETOOLONG);
 
@@ -856,7 +855,39 @@ impl Vfs {
             }
         }
         self.check_writable()?;
-        // Changing a remote file is copy-on-write.
+        // Changing a remote file's attributes needs no data: the new layer
+        // refers to the data it has. Changing its size is copy-on-write.
+        if set.size.is_none() {
+            let mut st = self.0.st.lock();
+            if let Content::Remote(_) = st.file(ino)?.content {
+                let f = st.file(ino)?;
+                let unchanged = set.mode.is_none_or(|m| (m & 0o7777) as u16 == f.mode)
+                    && set
+                        .mtime
+                        .is_none_or(|t| matches!(t, SetTime::At(t) if t == f.mtime));
+                if unchanged {
+                    return Ok(st.attr(&self.0.cfg, ino));
+                }
+                let due = self.due();
+                let f = st.file_mut(ino)?;
+                if let Some(mode) = set.mode {
+                    f.mode = (mode & 0o7777) as u16;
+                }
+                if let Some(t) = set.mtime {
+                    f.mtime = t.resolve();
+                }
+                f.generation += 1;
+                f.dirty = true;
+                let path = st.path(ino);
+                if st.node(ino)?.attached {
+                    st.set_op(&path, PendingOp::Put(ino), due);
+                }
+                let attr = st.attr(&self.0.cfg, ino);
+                drop(st);
+                self.0.wake.notify_one();
+                return Ok(attr);
+            }
+        }
         for _ in 0..3 {
             let rf = {
                 let st = self.0.st.lock();
@@ -1032,41 +1063,13 @@ impl Vfs {
         mode: RenameMode,
     ) -> Result<()> {
         self.check_writable()?;
-        for _ in 0..3 {
-            // Remote files are only renamed if their content is already
-            // local (it is copied).
-            let need = {
-                let mut st = self.0.st.lock();
-                match st.rename(
-                    &self.0.cfg,
-                    parent,
-                    name,
-                    newparent,
-                    newname,
-                    mode,
-                    self.due(),
-                )? {
-                    None => {
-                        drop(st);
-                        self.0.wake.notify_one();
-                        return Ok(());
-                    }
-                    Some(need) => need,
-                }
-            };
-            let state::RenameNeeds::Copy(files) = need;
-            if !files.iter().all(|(_, rf)| rf.present()) {
-                return Err(EXDEV);
-            }
-            for (ino, rf) in files {
-                let local = rf
-                    .materialize(&self.0.api, &self.0.store)
-                    .await
-                    .map_err(fetch_err)?;
-                self.0.st.lock().make_local(ino, &rf, local);
-            }
-        }
-        Err(EXDEV)
+        let due = self.due();
+        self.0
+            .st
+            .lock()
+            .rename(&self.0.cfg, parent, name, newparent, newname, mode, due)?;
+        self.0.wake.notify_one();
+        Ok(())
     }
 
     pub fn statfs(&self) -> (u64, u64, u64) {
