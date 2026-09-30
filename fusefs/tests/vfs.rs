@@ -419,13 +419,85 @@ async fn renaming_a_local_directory() {
     assert_eq!(ls(&b, ROOT), ["e"]);
     assert_eq!(ls_path(&b, "e").await, ["a", "sub"]);
     assert_eq!(cat(&b, "e/sub/b").await, b"B");
-    // Remote content cannot be moved in place.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_a_committed_directory() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o750).unwrap();
+    let big = noise(5000, 3);
+    write_file(&a, d.ino, "big", &big);
+    write_file(&a, d.ino, "tiny", b"inline");
+    a.symlink(d.ino, "link", "big").unwrap();
+    let sub = a.mkdir(d.ino, "sub", 0o755).unwrap();
+    a.mkdir(sub.ino, "empty", 0o700).unwrap();
+    write_file(&a, sub.ino, "f", b"F");
+    drained(&a).await;
+
+    // Files that are cached, inline, or symlinks move with their directory,
+    // and so do empty directories.
+    let b = job(&server, MAIN).await;
+    assert_eq!(cat(&b, "d/big").await, big);
+    let before = b.summary().requests.blob;
+    b.rename(ROOT, "d", ROOT, "e", RenameMode::Replace)
+        .await
+        .unwrap();
+    assert_eq!(ls(&b, ROOT), ["e"]);
+    let summary = b.drain().await;
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!(summary.layers, 1, "{summary:?}");
     assert_eq!(
-        b.rename(ROOT, "e", ROOT, "f", RenameMode::Replace)
+        summary.requests.blob - before,
+        1,
+        "no download: {summary:?}"
+    );
+
+    let c = job(&server, MAIN).await;
+    assert_eq!(ls(&c, ROOT), ["e"]);
+    assert_eq!(ls_path(&c, "e").await, ["big", "link", "sub", "tiny"]);
+    assert_eq!(cat(&c, "e/big").await, big);
+    assert_eq!(cat(&c, "e/tiny").await, b"inline");
+    assert_eq!(cat(&c, "e/sub/f").await, b"F");
+    let link = lookup(&c, "e/link").await.unwrap();
+    assert_eq!(c.readlink(link.ino).await.unwrap(), "big");
+    assert!(ls_path(&c, "e/sub/empty").await.is_empty());
+    assert_eq!(lookup(&c, "e").await.unwrap().perm, 0o750);
+    assert_eq!(lookup(&c, "e/sub/empty").await.unwrap().perm, 0o700);
+
+    // A file that is not cached would have to be downloaded, so mv copies.
+    let d = job(&server, MAIN).await;
+    assert_eq!(
+        d.rename(ROOT, "e", ROOT, "f", RenameMode::Replace)
             .await
             .unwrap_err(),
         Errno(libc::EXDEV)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_a_directory_this_job_already_saved() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let out = a.mkdir(ROOT, "out.tmp", 0o755).unwrap();
+    write_file(&a, out.ino, "result", &noise(5000, 4));
+    a.mkdir(ROOT, "empty", 0o755).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while a.pending() > 0 {
+        assert!(Instant::now() < deadline, "never committed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The layer it sealed is its cache, so nothing needs downloading.
+    a.rename(ROOT, "out.tmp", ROOT, "out", RenameMode::Replace)
+        .await
+        .unwrap();
+    a.rename(ROOT, "empty", ROOT, "still-empty", RenameMode::Replace)
+        .await
+        .unwrap();
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    assert_eq!(ls(&b, ROOT), ["out", "still-empty"]);
+    assert_eq!(cat(&b, "out/result").await, noise(5000, 4));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

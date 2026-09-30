@@ -84,7 +84,8 @@ In format 2, where *L* is the number of layers and blobs:
 | a batch of changes: files ≤ 8 MiB, symlinks, directories, deletions | `CreateCacheEntry`, `Put Blob` or 8 MiB blocks, `FinalizeCacheEntryUpload` | 1 |
 | a file over 8 MiB | the same, for its blob, unless a readable scope has it | 1 more |
 | `fsync` | nothing; with `--fsync commit`, a batch of its own if nothing else is due | 0 (1) |
-| `mv` of an uncached remote file over 1 KiB | `EXDEV`, so `mv` copies: download, then a layer | 1 |
+| `mv` of a cached file or directory | a layer holding it again under its new name, and whiteouts | 1 |
+| `mv` of an uncached remote file over 1 KiB, or a directory holding one | `EXDEV`, so `mv` copies: download, then a layer | 1 |
 
 Several consequences follow.
 

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use super::{
-    Attr, DirEntry, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EXDEV, Errno, FileKind,
-    Ino, ROOT, RenameMode, Result, VfsConfig, io_err,
+    Attr, DirEntry, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, FileKind, Ino, ROOT,
+    RenameMode, Result, VfsConfig, io_err,
 };
 use crate::data::{DataFile, DataStore, RemoteData, RemoteFile};
 use crate::entry::{Mark, join, split, valid_component};
@@ -122,8 +122,9 @@ pub(super) struct Pending {
 }
 
 pub(super) enum RenameNeeds {
-    /// The source's remote content must be made local first.
-    Copy(Ino, Arc<RemoteFile>),
+    /// These files' remote content must be made local first: the source,
+    /// or the files below it.
+    Copy(Vec<(Ino, Arc<RemoteFile>)>),
 }
 
 pub(super) struct State {
@@ -304,6 +305,23 @@ impl State {
             ino = self.child(ino, part)?;
         }
         Some(ino)
+    }
+
+    /// A directory and everything below it, parents first, each with its
+    /// path relative to the directory ("" for the directory itself).
+    fn tree(&self, dir: Ino) -> Vec<(Ino, String)> {
+        let mut out = vec![(dir, String::new())];
+        let mut i = 0;
+        while i < out.len() {
+            let (ino, path) = out[i].clone();
+            if let Ok(d) = self.dir(ino) {
+                for (name, &child) in &d.children {
+                    out.push((child, format!("{path}/{name}")));
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     fn is_ancestor(&self, ancestor: Ino, mut ino: Ino) -> bool {
@@ -970,34 +988,57 @@ impl State {
             if self.is_ancestor(src, newparent) {
                 return Err(EINVAL);
             }
-            if self.index.any_within(&cfg.full(&old_path)) {
-                // Remote content cannot be moved without copying it.
-                return Err(EXDEV);
+            let tree = self.tree(src);
+            let remote: Vec<(Ino, Arc<RemoteFile>)> = tree
+                .iter()
+                .filter_map(|(ino, _)| match &self.nodes[ino].body {
+                    Body::File(File {
+                        content: Content::Remote(rf),
+                        ..
+                    }) => Some((*ino, rf.clone())),
+                    _ => None,
+                })
+                .collect();
+            if !remote.is_empty() {
+                return Ok(Some(RenameNeeds::Copy(remote)));
             }
             if let Some(d) = dst {
                 self.detach(d);
                 self.retire(cfg, &new_path, None, due);
             }
             self.move_node(src, newparent, newname);
-            // Everything pending in the directory moves with it. (Keys that
-            // sort between "d" and "d/", such as "d.txt", are not in it.)
-            let old_prefix = format!("{old_path}/");
-            let mut moved: Vec<(String, PendingOp, Option<Instant>)> = Vec::new();
-            if let Some(p) = self.overlay.get(&old_path) {
-                moved.push((old_path.clone(), p.op.clone(), p.due));
-            }
-            moved.extend(
-                self.overlay
-                    .range(old_prefix.clone()..)
-                    .take_while(|(k, _)| k.starts_with(&old_prefix))
-                    .map(|(k, p)| (k.clone(), p.op.clone(), p.due)),
-            );
-            for (path, op, pdue) in moved {
-                if let PendingOp::Put(ino) = op {
-                    let suffix = &path[old_path.len()..];
-                    self.set_op(&format!("{new_path}{suffix}"), PendingOp::Put(ino), pdue);
-                    self.retire(cfg, &path, Some(ino), due);
-                }
+            // Everything in the directory moves with it: what is pending
+            // keeps its due time, and what is committed is committed again
+            // under its new name, with its content (now local) and a keep
+            // mark for each directory. Each old name is removed once its new
+            // name has landed.
+            for (ino, suffix) in tree {
+                let (old, new) = (format!("{old_path}{suffix}"), format!("{new_path}{suffix}"));
+                let pending = self
+                    .overlay
+                    .get(&old)
+                    .filter(|p| p.op == PendingOp::Put(ino))
+                    .map(|p| p.due);
+                let put_due = match (&mut self.node_mut(ino)?.body, pending) {
+                    (Body::Dir(d), pending) => {
+                        d.mark = Some(Mark::Keep);
+                        d.generation += 1;
+                        pending.unwrap_or(due)
+                    }
+                    (_, Some(pdue)) => pdue,
+                    (Body::File(f), None) => {
+                        f.dirty = true;
+                        f.generation += 1;
+                        if f.writers > 0 { None } else { due }
+                    }
+                    (Body::Symlink(s), None) => {
+                        s.dirty = true;
+                        s.generation += 1;
+                        due
+                    }
+                };
+                self.set_op(&new, PendingOp::Put(ino), put_due);
+                self.retire(cfg, &old, Some(ino), due);
             }
             self.pin(parent);
             return Ok(None);
@@ -1013,7 +1054,7 @@ impl State {
             ..
         }) = &self.node(src)?.body
         {
-            return Ok(Some(RenameNeeds::Copy(src, rf.clone())));
+            return Ok(Some(RenameNeeds::Copy(vec![(src, rf.clone())])));
         }
         if let Some(d) = dst {
             self.detach(d);

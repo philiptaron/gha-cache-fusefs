@@ -1033,8 +1033,8 @@ impl Vfs {
     ) -> Result<()> {
         self.check_writable()?;
         for _ in 0..3 {
-            // A remote file is only renamed if its content is already local
-            // (it is copied).
+            // Remote files are only renamed if their content is already
+            // local (it is copied).
             let need = {
                 let mut st = self.0.st.lock();
                 match st.rename(
@@ -1054,15 +1054,17 @@ impl Vfs {
                     Some(need) => need,
                 }
             };
-            let state::RenameNeeds::Copy(ino, rf) = need;
-            if !rf.present() {
+            let state::RenameNeeds::Copy(files) = need;
+            if !files.iter().all(|(_, rf)| rf.present()) {
                 return Err(EXDEV);
             }
-            let local = rf
-                .materialize(&self.0.api, &self.0.store)
-                .await
-                .map_err(fetch_err)?;
-            self.0.st.lock().make_local(ino, &rf, local);
+            for (ino, rf) in files {
+                let local = rf
+                    .materialize(&self.0.api, &self.0.store)
+                    .await
+                    .map_err(fetch_err)?;
+                self.0.st.lock().make_local(ino, &rf, local);
+            }
         }
         Err(EXDEV)
     }
