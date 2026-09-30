@@ -39,6 +39,12 @@ pub enum Item {
         entry: Listed,
         sha: String,
     },
+    /// A snapshot, which covers its scope's layers created before `covers`.
+    Snapshot {
+        entry: Listed,
+        meta_blocks: u32,
+        covers: SystemTime,
+    },
 }
 
 /// A layer and the tree it holds.
@@ -53,6 +59,12 @@ pub struct Layer {
     pub entries: Vec<erofs::Entry>,
     /// The download URL its metadata was read with, if any.
     pub url: Option<String>,
+    /// For a snapshot: the layers of its scope created before this are
+    /// covered.
+    pub covers: Option<SystemTime>,
+    /// A snapshot covers it, so its metadata was not read, and it holds
+    /// nothing but data that other layers may refer to.
+    pub covered: bool,
 }
 
 impl Layer {
@@ -65,8 +77,42 @@ impl Layer {
             devices: listing.devices.into_iter().map(|(tag, _)| tag).collect(),
             entries: listing.entries,
             url: None,
+            covers: None,
+            covered: false,
         })
     }
+
+    /// A covered layer, whose metadata is not read.
+    pub fn covered(entry: Listed, meta_blocks: u32) -> Layer {
+        Layer {
+            entry,
+            meta_blocks,
+            devices: Vec::new(),
+            entries: Vec::new(),
+            url: None,
+            covers: None,
+            covered: true,
+        }
+    }
+}
+
+/// A path as a stack of layers leaves it, before it is decided which
+/// directories exist.
+#[derive(Clone, Debug)]
+pub enum Stacked {
+    Dir {
+        meta: erofs::Meta,
+        /// Some layer marked it `keep`, `attrs`, or `attrs-drop`.
+        attrs_marked: bool,
+        /// The last `keep` or `drop` mark (`attrs-drop` counts as `drop`).
+        mark: Option<Mark>,
+    },
+    Leaf(Node),
+    /// A file whose blob or layer is gone: it hides what is below, but is
+    /// not there itself.
+    Gone,
+    /// A whiteout left standing: it hides what lower scopes have here.
+    Whiteout,
 }
 
 /// Which node of which layer.
@@ -134,6 +180,32 @@ impl Node {
     }
 }
 
+/// The paths of a stack that exist: leaves, and directories that are kept
+/// or have something below them that exists.
+fn existing(tree: &BTreeMap<String, Stacked>) -> HashSet<&str> {
+    let mut needed: HashSet<&str> = HashSet::new();
+    needed.insert("");
+    for (path, s) in tree {
+        let anchor = match s {
+            Stacked::Leaf(_) => true,
+            Stacked::Dir { mark, .. } => *mark == Some(Mark::Keep),
+            Stacked::Gone | Stacked::Whiteout => false,
+        };
+        if !anchor {
+            continue;
+        }
+        needed.insert(path.as_str());
+        let mut p = path.as_str();
+        while !p.is_empty() {
+            p = entry::parent(p);
+            if !needed.insert(p) {
+                break;
+            }
+        }
+    }
+    needed
+}
+
 /// The attributes of a directory no layer has.
 pub fn default_dir_meta() -> erofs::Meta {
     erofs::Meta {
@@ -149,6 +221,8 @@ pub struct Index {
     volume: Volume,
     scopes: Vec<String>,
     layers: Vec<Arc<Layer>>,
+    /// Per scope: the snapshot read covers its layers created before this.
+    covered_before: Vec<Option<SystemTime>>,
     /// Layers by the tag a device slot refers to them with.
     by_tag: HashMap<String, Arc<Layer>>,
     /// By digest: the entry to read a blob from.
@@ -183,6 +257,7 @@ impl Index {
             blobs: HashMap::new(),
             seen: HashSet::new(),
             watermark: vec![None; n],
+            covered_before: vec![None; n],
             view,
         }
     }
@@ -201,6 +276,11 @@ impl Index {
         if self.seen.contains(&item.id) {
             return None;
         }
+        self.describe(item)
+    }
+
+    /// What a listed item is, known or not.
+    pub fn describe(&self, item: &CacheItem) -> Option<Item> {
         let version = Version::decode(&item.version)?;
         let scope = self.scopes.iter().position(|s| *s == item.git_ref)?;
         let entry = Listed {
@@ -217,6 +297,17 @@ impl Index {
                 Some(Item::Layer { entry, meta_blocks })
             }
             (KeyKind::Blob(sha), Kind::Blob) => Some(Item::Blob { entry, sha }),
+            (
+                KeyKind::Layer,
+                Kind::Snapshot {
+                    meta_blocks,
+                    covers,
+                },
+            ) => Some(Item::Snapshot {
+                entry,
+                meta_blocks,
+                covers,
+            }),
             _ => None,
         }
     }
@@ -232,8 +323,52 @@ impl Index {
         true
     }
 
-    /// Records a layer. `restack` then shows it.
+    /// Whether the snapshot of the entry's scope covers it.
+    pub fn is_covered(&self, e: &Listed) -> bool {
+        self.covered_before
+            .get(e.scope)
+            .copied()
+            .flatten()
+            .is_some_and(|t| e.created < t)
+    }
+
+    /// When the layers the snapshot of a scope covers end.
+    pub fn covered_before(&self, scope: usize) -> Option<SystemTime> {
+        self.covered_before.get(scope).copied().flatten()
+    }
+
+    /// The snapshot read for a scope.
+    pub fn snapshot(&self, scope: usize) -> Option<&Arc<Layer>> {
+        self.layers
+            .iter()
+            .find(|l| l.covers.is_some() && l.entry.scope == scope)
+    }
+
+    /// Layers of a scope created before `before` that no snapshot covers.
+    pub fn uncovered(&self, scope: usize, before: SystemTime) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| l.entry.scope == scope && !l.covered && l.covers.is_none())
+            .filter(|l| l.entry.created < before)
+            .count()
+    }
+
+    /// A layer by its entry's id.
+    pub fn layer(&self, id: i64) -> Option<&Arc<Layer>> {
+        self.layers.iter().find(|l| l.entry.id == id)
+    }
+
+    /// Records a layer, or a scope's snapshot (only one per scope, before
+    /// any of its layers). `restack` then shows it.
     pub fn insert_layer(&mut self, layer: Layer) -> bool {
+        if let Some(t) = layer.covers {
+            if self.covered_before(layer.entry.scope).is_some() {
+                return false;
+            }
+            if let Some(c) = self.covered_before.get_mut(layer.entry.scope) {
+                *c = Some(t);
+            }
+        }
         if !self.saw(&layer.entry) {
             return false;
         }
@@ -312,21 +447,47 @@ impl Index {
 
     /// Applies the layers bottom up, as LAYERS.md §4 says.
     fn stack(&self) -> BTreeMap<String, Node> {
-        enum Stacked {
-            Dir {
-                meta: erofs::Meta,
-                /// Some layer marked it `keep` or `attrs`.
-                attrs_marked: bool,
-                /// The last `keep` or `drop` mark.
-                mark: Option<Mark>,
-            },
-            Leaf(Node),
-            /// A file whose blob is gone: it hides what is below, but is
-            /// not there itself.
-            Gone,
-        }
         let mut order: Vec<&Arc<Layer>> = self.layers.iter().collect();
-        order.sort_by_key(|l| (Reverse(l.entry.scope), l.entry.created, l.entry.id));
+        order.sort_by_key(|l| {
+            let (at, id) = match l.covers {
+                // Below every layer it does not cover.
+                Some(t) => (t, i64::MIN),
+                None => (l.entry.created, l.entry.id),
+            };
+            (Reverse(l.entry.scope), at, id)
+        });
+        let tree = self.stack_tree(&order);
+        let exists = existing(&tree);
+        let mut view = BTreeMap::new();
+        for (path, s) in &tree {
+            match s {
+                Stacked::Leaf(node) => {
+                    view.insert(path.clone(), node.clone());
+                }
+                Stacked::Dir { meta, mark, .. } if exists.contains(path.as_str()) => {
+                    let keep = *mark == Some(Mark::Keep);
+                    view.insert(path.clone(), Node::Dir { meta: *meta, keep });
+                }
+                _ => {}
+            }
+        }
+        view
+    }
+
+    /// What `layers` stack to, in the order given, as a snapshot of their
+    /// scope needs it (LAYERS.md §8): whiteouts kept, and directories that
+    /// do not exist too. Also returns the paths that exist.
+    pub fn stack_scope(
+        &self,
+        layers: &[Arc<Layer>],
+    ) -> (BTreeMap<String, Stacked>, HashSet<String>) {
+        let order: Vec<&Arc<Layer>> = layers.iter().collect();
+        let tree = self.stack_tree(&order);
+        let exists = existing(&tree).into_iter().map(str::to_string).collect();
+        (tree, exists)
+    }
+
+    fn stack_tree(&self, order: &[&Arc<Layer>]) -> BTreeMap<String, Stacked> {
         let mut tree: BTreeMap<String, Stacked> = BTreeMap::new();
         tree.insert(
             String::new(),
@@ -356,14 +517,20 @@ impl Index {
                 };
                 match &e.kind {
                     _ if e.is_whiteout() => {
-                        if matches!(tree.get(&e.path), Some(Stacked::Leaf(_) | Stacked::Gone)) {
-                            tree.remove(&e.path);
+                        // A directory here came from another writer.
+                        if !matches!(tree.get(&e.path), Some(Stacked::Dir { .. })) {
+                            tree.insert(e.path.clone(), Stacked::Whiteout);
                         }
                     }
                     erofs::EntryKind::Dir => {
                         let marked = e.xattr(DIR_XATTR).and_then(Mark::parse);
-                        let sets_attrs = matches!(marked, Some(Mark::Keep | Mark::Attrs));
-                        let new_mark = marked.filter(|m| *m != Mark::Attrs);
+                        let sets_attrs =
+                            matches!(marked, Some(Mark::Keep | Mark::Attrs | Mark::AttrsDrop));
+                        let new_mark = match marked {
+                            Some(Mark::Keep) => Some(Mark::Keep),
+                            Some(Mark::Drop | Mark::AttrsDrop) => Some(Mark::Drop),
+                            _ => None,
+                        };
                         match tree.get_mut(&e.path) {
                             Some(Stacked::Dir {
                                 meta,
@@ -431,43 +598,7 @@ impl Index {
                 );
             }
         }
-
-        // A directory exists while it is kept, or anything below it exists.
-        let mut needed: HashSet<&str> = HashSet::new();
-        needed.insert("");
-        for (path, s) in &tree {
-            let anchor = match s {
-                Stacked::Leaf(_) => true,
-                Stacked::Dir { mark, .. } => *mark == Some(Mark::Keep),
-                Stacked::Gone => false,
-            };
-            if !anchor {
-                continue;
-            }
-            let mut p = path.as_str();
-            while !p.is_empty() {
-                p = entry::parent(p);
-                if !needed.insert(p) {
-                    break;
-                }
-            }
-        }
-        let mut view = BTreeMap::new();
-        for (path, s) in &tree {
-            match s {
-                Stacked::Leaf(node) => {
-                    view.insert(path.clone(), node.clone());
-                }
-                Stacked::Dir { meta, mark, .. } => {
-                    let keep = *mark == Some(Mark::Keep);
-                    if keep || needed.contains(path.as_str()) {
-                        view.insert(path.clone(), Node::Dir { meta: *meta, keep });
-                    }
-                }
-                Stacked::Gone => {}
-            }
-        }
-        view
+        tree
     }
 
     /// Where a file's bytes are: `Ok(None)` if the blob or layer it refers
@@ -547,20 +678,23 @@ impl Index {
             .sum()
     }
 
-    /// Blobs that visible files refer to, last used before `cutoff`, the
-    /// stalest first. Nothing else keeps them alive (LAYERS.md §7).
-    pub fn stale_blobs(&self, cutoff: SystemTime, max: usize) -> Vec<Listed> {
+    /// Blobs and covered layers that visible files refer to, last used
+    /// before `cutoff`, the stalest first. Nothing else keeps them alive
+    /// (LAYERS.md §7).
+    pub fn stale_entries(&self, cutoff: SystemTime, max: usize) -> Vec<Listed> {
         let mut seen = HashSet::new();
         let mut out: Vec<&Listed> = self
             .view
             .values()
             .filter_map(|n| match n {
                 Node::File(f) => match &f.data {
-                    Where::Blob { blob, .. } if blob.accessed < cutoff => Some(blob),
+                    Where::Blob { blob, .. } => Some(blob),
+                    Where::Layer { layer, .. } if layer.covered => Some(&layer.entry),
                     _ => None,
                 },
                 _ => None,
             })
+            .filter(|e| e.accessed < cutoff)
             .filter(|b| seen.insert(b.id))
             .collect();
         out.sort_by_key(|b| b.accessed);
@@ -601,6 +735,33 @@ pub async fn read_layers(api: &Api, layers: Vec<(Listed, u32)>) -> Result<Vec<La
 
 /// Layers whose metadata is read at once.
 const LAYER_READS: usize = 16;
+
+/// Reads, in each scope, the snapshot with the largest T whose metadata
+/// can be read (LAYERS.md §8).
+pub async fn read_snapshots(
+    api: &Api,
+    mut snapshots: Vec<(Listed, u32, SystemTime)>,
+) -> Result<Vec<Layer>, ApiError> {
+    snapshots.sort_by_key(|(e, _, covers)| Reverse((*covers, e.created, e.id)));
+    let mut by_scope: BTreeMap<usize, Vec<(Listed, u32, SystemTime)>> = BTreeMap::new();
+    for s in snapshots {
+        by_scope.entry(s.0.scope).or_default().push(s);
+    }
+    let per_scope = by_scope.into_values().map(|candidates| async move {
+        for (entry, meta_blocks, covers) in candidates {
+            if let Some(mut layer) = read_layer(api, entry, meta_blocks).await? {
+                layer.covers = Some(covers);
+                return Ok(Some(layer));
+            }
+        }
+        Ok::<_, ApiError>(None)
+    });
+    Ok(try_join_all(per_scope)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
+}
 
 async fn read_layer(api: &Api, entry: Listed, meta_blocks: u32) -> Result<Option<Layer>, ApiError> {
     let len = (u64::from(meta_blocks) * erofs::BLOCK).min(entry.size);
@@ -650,7 +811,11 @@ pub async fn list_all(
 /// Listing again when the entries changed while we paged, at most this often.
 const LISTINGS: usize = 3;
 
-async fn list_scope(rest: &Rest, prefix: &str, scope: &str) -> Result<Vec<CacheItem>, ApiError> {
+pub async fn list_scope(
+    rest: &Rest,
+    prefix: &str,
+    scope: &str,
+) -> Result<Vec<CacheItem>, ApiError> {
     // Pages are cut by position, so an entry deleted while we page (by
     // eviction, or by another job's gc) moves an entry across a page boundary
     // that we have already read, and we never see it. Every page reports the
@@ -1067,7 +1232,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let stale = ix.stale_blobs(SystemTime::now(), 10);
+        let stale = ix.stale_entries(SystemTime::now(), 10);
         assert_eq!(stale.len(), 1);
         assert_eq!(ix.visible_bytes(), 20 << 20);
     }

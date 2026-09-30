@@ -8,6 +8,7 @@
 //! LAYERS.md.
 
 mod commit;
+mod snapshot;
 mod state;
 
 use std::collections::BTreeMap;
@@ -138,6 +139,12 @@ pub struct VfsConfig {
     /// How long a closed file waits before it is uploaded.
     pub settle: Duration,
     pub fsync: FsyncMode,
+    /// Write a snapshot at unmount if it would cover at least this many
+    /// layers (0: never).
+    pub snapshot_after: usize,
+    /// How old a layer must be for a snapshot to cover it: the listing
+    /// must already have shown it (LAYERS.md §8).
+    pub snapshot_margin: Duration,
     /// Minimum time between refreshes triggered by lookup misses.
     pub refresh: Option<Duration>,
     pub uid: u32,
@@ -157,6 +164,8 @@ impl VfsConfig {
             read_only: false,
             settle: Duration::from_secs(1),
             fsync: FsyncMode::Local,
+            snapshot_after: 16,
+            snapshot_margin: Duration::from_secs(120),
             refresh: Some(Duration::from_secs(15)),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -217,10 +226,12 @@ pub struct Summary {
     /// Cache entries created: one layer per batch, one blob per large file.
     pub layers: u64,
     pub blobs: u64,
+    /// Snapshots written at unmount.
+    pub snapshots: u64,
     pub download_requests: u64,
     pub downloaded_bytes: u64,
-    /// Blobs kept from expiring because nothing read them (see
-    /// `Vfs::touch_stale`).
+    /// Blobs and covered layers kept from expiring because nothing read
+    /// them (see `Vfs::touch_stale`).
     pub touched: u64,
     pub requests: Requests,
     /// Responses that asked us to slow down (429, or an exhausted REST quota).
@@ -238,6 +249,7 @@ struct Stats {
     dir_markers: AtomicU64,
     layers: AtomicU64,
     blobs: AtomicU64,
+    snapshots: AtomicU64,
     touched: AtomicU64,
 }
 
@@ -272,19 +284,27 @@ impl Vfs {
         let mut index = Index::new(cfg.volume.clone(), scopes);
         let prefix = cfg.volume.prefix();
         let items = index::list_all(&api.rest, prefix, index.scopes()).await?;
-        let (layers, blobs, foreign) = sort_items(&index, &items);
-        let (n_layers, n_blobs) = (layers.len(), blobs.len());
-        for (entry, sha) in blobs {
+        let sorted = sort_items(&index, &items);
+        let (n_layers, n_blobs) = (sorted.layers.len(), sorted.blobs.len());
+        for (entry, sha) in sorted.blobs {
             index.insert_blob(entry, sha);
         }
+        let snapshots = index::read_snapshots(&api, sorted.snapshots).await?;
+        let n_snapshots = snapshots.len();
+        for snapshot in snapshots {
+            index.insert_layer(snapshot);
+        }
+        let layers = take_covered(&mut index, sorted.layers);
+        let n_read = layers.len();
         for layer in index::read_layers(&api, layers).await? {
             index.insert_layer(layer);
         }
         index.restack();
         tracing::info!(
-            "listed {} entries under {prefix:?} in {:?} ({n_layers} layers, {n_blobs} blobs, {foreign} ignored)",
+            "listed {} entries under {prefix:?} in {:?} ({n_layers} layers, {n_read} of them read, {n_snapshots} snapshots read, {n_blobs} blobs, {} ignored)",
             items.len(),
-            index.scopes()
+            index.scopes(),
+            sorted.foreign
         );
         let vfs = Vfs::with_index(cfg, api, store, index);
         vfs.touch_stale();
@@ -302,12 +322,12 @@ impl Vfs {
             let cutoff = SystemTime::now()
                 .checked_sub(TOUCH_AFTER)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            st.index.stale_blobs(cutoff, TOUCH_MAX)
+            st.index.stale_entries(cutoff, TOUCH_MAX)
         };
         if stale.is_empty() {
             return;
         }
-        tracing::debug!("touching {} blobs nothing read", stale.len());
+        tracing::debug!("touching {} blobs and layers nothing read", stale.len());
         let vfs = self.clone();
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -453,11 +473,14 @@ impl Vfs {
                 .map(|(scope, mark)| index::list_since(&self.0.api.rest, prefix, scope, mark)),
         )
         .await;
+        // Snapshots change nothing the mount shows, so a refresh ignores
+        // them; a layer the mount's snapshot covers is not read.
         let result = async {
             let items: Vec<_> = lists?.into_iter().flatten().collect();
-            let (layers, blobs, _) = sort_items(&self.0.st.lock().index, &items);
+            let sorted = sort_items(&self.0.st.lock().index, &items);
+            let layers = take_covered(&mut self.0.st.lock().index, sorted.layers);
             let layers = index::read_layers(&self.0.api, layers).await?;
-            anyhow::Ok((layers, blobs))
+            anyhow::Ok((layers, sorted.blobs))
         }
         .await;
         let mut st = self.0.st.lock();
@@ -1105,6 +1128,10 @@ impl Vfs {
             // milliseconds; checking after each one would be quadratic.
             tokio::time::sleep(DRAIN_CHECK).await;
         }
+        // A snapshot is an optimization: failing to write one fails nothing.
+        if let Err(e) = self.snapshot().await {
+            tracing::warn!("writing a snapshot: {e:#}");
+        }
         self.summary()
     }
 
@@ -1118,6 +1145,7 @@ impl Vfs {
             whiteouts: s.whiteouts.load(Ordering::Relaxed),
             dir_markers: s.dir_markers.load(Ordering::Relaxed),
             layers: s.layers.load(Ordering::Relaxed),
+            snapshots: s.snapshots.load(Ordering::Relaxed),
             blobs: s.blobs.load(Ordering::Relaxed),
             download_requests: self.0.store.stats.requests.load(Ordering::Relaxed),
             downloaded_bytes: self.0.store.stats.bytes.load(Ordering::Relaxed),
@@ -1171,26 +1199,45 @@ const TOUCH_CONCURRENCY: usize = 4;
 /// Listed items that are new: layers, whose metadata must be read, and
 /// blobs; and how many are not ours.
 #[allow(clippy::type_complexity)]
-fn sort_items(
-    index: &Index,
-    items: &[crate::api::CacheItem],
-) -> (
-    Vec<(index::Listed, u32)>,
-    Vec<(index::Listed, String)>,
-    usize,
-) {
-    let (mut layers, mut blobs, mut foreign) = (Vec::new(), Vec::new(), 0);
+/// New entries of a listing, by kind.
+#[derive(Default)]
+struct Sorted {
+    layers: Vec<(index::Listed, u32)>,
+    blobs: Vec<(index::Listed, String)>,
+    snapshots: Vec<(index::Listed, u32, SystemTime)>,
+    /// Entries this filesystem did not write.
+    foreign: usize,
+}
+
+fn sort_items(index: &Index, items: &[crate::api::CacheItem]) -> Sorted {
+    let mut out = Sorted::default();
     let mut new = std::collections::HashSet::new();
     for item in items {
         match index.classify(item) {
             Some(_) if !new.insert(item.id) => {}
-            Some(Item::Layer { entry, meta_blocks }) => layers.push((entry, meta_blocks)),
-            Some(Item::Blob { entry, sha }) => blobs.push((entry, sha)),
-            None if Version::decode(&item.version).is_none() => foreign += 1,
+            Some(Item::Layer { entry, meta_blocks }) => out.layers.push((entry, meta_blocks)),
+            Some(Item::Blob { entry, sha }) => out.blobs.push((entry, sha)),
+            Some(Item::Snapshot {
+                entry,
+                meta_blocks,
+                covers,
+            }) => out.snapshots.push((entry, meta_blocks, covers)),
+            None if Version::decode(&item.version).is_none() => out.foreign += 1,
             None => {}
         }
     }
-    (layers, blobs, foreign)
+    out
+}
+
+/// Records the layers a snapshot covers without reading them, and returns
+/// the rest, whose metadata must be read.
+fn take_covered(index: &mut Index, layers: Vec<(index::Listed, u32)>) -> Vec<(index::Listed, u32)> {
+    let (covered, rest): (Vec<_>, Vec<_>) =
+        layers.into_iter().partition(|(e, _)| index.is_covered(e));
+    for (entry, meta_blocks) in covered {
+        index.insert_layer(index::Layer::covered(entry, meta_blocks));
+    }
+    rest
 }
 
 impl Handle {

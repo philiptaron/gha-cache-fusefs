@@ -319,6 +319,17 @@ impl FakeServer {
             .collect()
     }
 
+    /// The version of the newest finalized entry with this key in `scope`.
+    pub fn version(&self, key: &str, scope: &str) -> Option<String> {
+        self.inner
+            .entries
+            .lock()
+            .iter()
+            .filter(|e| e.finalized && e.key == key && e.scope == scope)
+            .max_by_key(|e| (e.created, e.id))
+            .map(|e| e.version.clone())
+    }
+
     /// The content of the newest finalized entry with this key in `scope`.
     pub fn data(&self, key: &str, scope: &str) -> Option<Bytes> {
         let id = self

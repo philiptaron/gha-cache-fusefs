@@ -180,13 +180,16 @@ the same directory survive. Deleting on a feature branch hides the default
 branch's file on that branch only, which is how overlayfs behaves and how
 cache scoping already works.
 
-The service evicts an entry a week after its last *download*. Every mount
-reads every layer's metadata, which keeps layers alive while the volume is
-in use. Blobs are downloaded only when read, so a mount touches (resolves a
-download URL for) the blobs of visible files that were last used more than
-three days ago, at most 1,000 per mount, the stalest first. Layers
-accumulate; snapshots, which would let old ones expire, are future work
-(LAYERS.md §8).
+The service evicts an entry a week after its last *download*. A mount reads
+the metadata of each scope's newest snapshot and of the layers it does not
+cover (LAYERS.md §8), which keeps them alive while the volume is in use.
+Blobs, and covered layers, are downloaded only when read, so a mount
+touches (resolves a download URL for) those that visible files refer to
+and that were last used more than three days ago, at most 1,000 per mount,
+the stalest first. At unmount, a mount that would cover 16 layers of its
+own scope writes a snapshot of them: a layer of metadata only, which refers
+to their data where it is. Covered layers that nothing refers to then
+expire.
 
 ## 4. Architecture
 
@@ -280,8 +283,9 @@ accumulate; snapshots, which would let old ones expire, are future work
 6. **Unmount drains.** Every pending op becomes due immediately, and empty
    directories that exist only locally get a `keep` mark. A rename's
    whiteout goes in the layer of its new name, or a later one, so that a
-   failed upload cannot lose data. The daemon exits non-zero if anything
-   failed.
+   failed upload cannot lose data. Then, if it would cover 16 layers, the
+   mount writes a snapshot of its scope (LAYERS.md §8); failing to is not a
+   failure. The daemon exits non-zero if anything failed.
 
 Opening a *remote* file for writing is copy-on-write. `O_TRUNC` starts empty;
 otherwise the whole file is fetched first. The same applies to `truncate` of
@@ -407,8 +411,9 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 
 ## 10. Future work
 
-* Snapshots (LAYERS.md §8): a layer holding the merged tree of its scope,
-  so that the layers it covers can expire, and with them garbage collection.
+* Compacting covered layers that are mostly overwritten, so that they can
+  expire (LAYERS.md §8). Deleting them instead is not safe, since other
+  scopes may refer to their data.
 * Skipping unchanged uploads: `cp -a`, `tar -x`, and `rsync` of mostly
   unchanged trees rewrite every file.
 * Lazy copy-on-write: opening a remote file read-write downloads it at once,
