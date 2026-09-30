@@ -93,9 +93,9 @@ service with `actions/cache/save` and `actions/cache/restore`.
   layer, which keeps a volume in use alive; old layers are never dropped
   yet, so a volume only grows. Creating entries is rate limited, to about
   200 per ~45 s per repository. A batch of changes is one entry however
-  many files it has, so this only matters for programs that `fsync` every
-  file, or for many files over 8 MiB; the daemon then waits as instructed
-  (`Retry-After`).
+  many files it has, so this only matters for many files over 8 MiB, or
+  with `fsync: commit` for programs that `fsync` every file; the daemon
+  then waits as instructed (`Retry-After`).
 * The REST budget of `GITHUB_TOKEN` (1,000 requests an hour, per
   repository) pays for listings: one request per 100 layers and blobs per
   scope at every mount.
@@ -110,6 +110,7 @@ service with `actions/cache/save` and `actions/cache/restore`.
 | `read-only` | `false` | |
 | `token` | `${{ github.token }}` | for listing entries |
 | `settle` | `1s` | how long a closed file waits before it is saved, so write-then-rename saves only the final name |
+| `fsync` | `local` | what `fsync` waits for: `local` returns at once, and the file uploads with the next batch; `commit` uploads it and waits, a layer per call |
 | `cache-size-mb` | `8192` | local disk budget for downloaded data |
 | `binary` | | a prebuilt binary; otherwise one is downloaded from a release, or built with Nix or cargo |
 | `release` | | the release to download the binary from (`vX.Y.Z`, `main-latest`); by default, the one for the action's ref (`main-latest` for `@main`) |
