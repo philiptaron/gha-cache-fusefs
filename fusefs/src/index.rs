@@ -662,6 +662,14 @@ impl Index {
         matches!(self.view.get(path), Some(Node::Dir { keep: true, .. }))
     }
 
+    /// The nodes below a directory of the view, sorted, parents first.
+    pub fn below<'a>(&'a self, dir: &str) -> impl Iterator<Item = (&'a String, &'a Node)> {
+        let prefix = format!("{dir}/");
+        self.view
+            .range(prefix.clone()..)
+            .take_while(move |(p, _)| p.starts_with(&prefix))
+    }
+
     /// Every path in the view, sorted, parents first.
     pub fn paths(&self) -> impl Iterator<Item = &String> {
         self.view.keys()

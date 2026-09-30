@@ -641,6 +641,13 @@ impl State {
                 let ino = if path.is_empty() {
                     ROOT
                 } else {
+                    // The view has it only for what is below it, and this
+                    // mount removed all that: a directory renamed while a
+                    // file in it is open, whose drop commits before the
+                    // whiteout that waits for the file's new name.
+                    if !keep && self.resolve(path).is_none() && !self.shows_below(cfg, path) {
+                        return;
+                    }
                     match self.ensure_dir(path) {
                         Some(ino) => ino,
                         None => return,
@@ -711,6 +718,18 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Whether the view has something below `path` that no pending op
+    /// hides: a file or symlink, or a kept directory.
+    fn shows_below(&self, cfg: &VfsConfig, path: &str) -> bool {
+        self.index.below(&cfg.full(path)).any(|(full, node)| {
+            let shown = !matches!(node, ViewNode::Dir { keep: false, .. });
+            shown
+                && cfg
+                    .local(full)
+                    .is_some_and(|p| !self.overlay.contains_key(p))
+        })
     }
 
     /// Finds or creates (as implicit) the directory at `path`. A clean remote
