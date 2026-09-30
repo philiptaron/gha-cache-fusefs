@@ -69,7 +69,7 @@ subset of it:
 ```
 block 0  ┬ 1024 zero bytes (boot area)
          ├ superblock (128 bytes)
-         ├ device slots, one per blob the layer refers to (128 bytes each)
+         ├ device slots, one per blob or layer it refers to (128 bytes each)
          ├ inodes, each followed by its xattrs, inline data, and chunk indexes
          ├ directory blocks that do not fit inline
 block M  ┴ file data in path order, block aligned
@@ -83,7 +83,7 @@ block. A mount reads a layer's metadata with one ranged GET.
 **Superblock.** Magic `0xE0F5E1E2`, 4 KiB blocks (`blkszbits` 12), the
 metadata area at block 0, no compression, and no checksum.
 `feature_incompat` has `CHUNKED_FILE` and `DEVICE_TABLE` exactly when the
-layer refers to blobs.
+layer refers to blobs or other layers.
 
 **Inodes** are always the 64-byte extended form, because compact inodes
 lack nanosecond mtimes. `i_uid` and `i_gid` are the writer's; a mount shows
@@ -95,6 +95,7 @@ a byte offset divided by 32.
 | file up to 1 KiB | `S_IFREG` \| perm | flat inline (2) | all of it, after the inode |
 | file up to 8 MiB | `S_IFREG` \| perm | flat plain (0) | whole blocks at `startblk`, in this layer |
 | larger file | `S_IFREG` \| perm | chunk based (4) | 16 MiB chunks of one blob, through its device slot |
+| moved file | `S_IFREG` \| perm | chunk based (4) | 16 MiB chunks of the blob or layer that has its data, through its device slot |
 | symlink | `S_IFLNK` \| 0777 | flat inline | the target |
 | whiteout | `S_IFCHR`, rdev 0:0 | none | none |
 | directory | `S_IFDIR` \| perm | flat inline or plain | EROFS dirents, sorted, with `.` and `..` |
@@ -121,10 +122,21 @@ the `user.` namespace, which overlayfs ignores.
 `keep` does what format 1's directory markers do, and `drop` what their
 whiteouts do.
 
-**Devices.** Each blob a layer refers to has a device slot. Its `tag` is
-the blob's SHA-256 in hex (exactly 64 bytes), `blocks` is its size in
-blocks, and `uniaddr` is zero. Chunk indexes name the slot in
-`device_id`: 1 is the first slot, and 0 is the layer itself.
+**Devices.** Each blob or other layer a layer refers to has a device slot.
+Its `tag` is the blob's SHA-256 in hex (exactly 64 bytes), or `layer/`
+and the other layer's nonce (22 bytes, as in its key). `blocks` is the
+entry's size in blocks, and `uniaddr` is zero. Chunk indexes name the slot
+in `device_id`: 1 is the first slot, and 0 is the layer itself. A file's
+chunks are consecutive, from any block of the device, so a file whose data
+is at block *b* of another layer takes one chunk index per 16 MiB, starting
+at *b*.
+
+A layer refers to another layer to commit a file of the view again without
+its data: when it is renamed, when a directory above it is, and when its
+mode or mtime change. The reference is to where the data is, never to the
+layer that referred to it last, so references never chain. As with blobs,
+a run can refer only to layers it can read, which a run reading its layer
+can read too.
 
 **The root** carries `user.gha-fs.writer`: the tool's version and the run
 that wrote the layer, for debugging.
@@ -161,8 +173,8 @@ container runtimes apply image layers:
 That differs from overlayfs in one place, on purpose: an overlayfs
 whiteout hides a directory too.
 
-A file that refers to a blob missing from the listing, because it was
-evicted, is absent as well. It still replaces what was below it: the layer
+A file that refers to a blob or layer missing from the listing, because it
+was evicted, is absent as well. It still replaces what was below it: the layer
 did write it, and an older version showing through would be wrong.
 
 ## 5. Writing layers
@@ -171,7 +183,8 @@ The committer (DESIGN.md §5) turns each batch of due operations into one
 layer, of at most 10,000 paths or 256 MiB of data. A larger batch makes
 more layers. A layer contains:
 
-* the files and symlinks written, with their data;
+* the files and symlinks written, with their data, and files of the view
+  renamed or changed in their attributes, referring to their data (§3);
 * whiteouts for the non-directories removed that the layers below show;
 * directory marks, as above;
 * the directories above all of these, passing through, with the
@@ -223,8 +236,10 @@ did.
   order, so a directory's small files are one range of it: the first read
   of one prefetches that range, in a few large requests.
 * **Blob data** is read with ranged GETs on the blob.
-* **Symlink targets** are in the metadata, so `readlink` never waits, and
-  renaming a remote symlink or a file of up to 1 KiB needs no download.
+* **Symlink targets** are in the metadata, so `readlink` never waits.
+* **Renaming** a remote file or directory, or changing a remote file's mode
+  or mtime, needs no download: the new layer refers to the data where it
+  is (§3).
 
 A refresh after a lookup miss lists the layers created since the last
 listing, reads their metadata, and merges them in.
@@ -250,13 +265,8 @@ cover. Covered layers are then no longer read, so they expire unless the
 snapshot still needs their data:
 
 * Small files are copied into the snapshot.
-* Larger data is referred to through device slots tagged `layer/<nonce>`,
-  which mounts touch like blobs.
-
-The same references let `mv` of a remote file or directory become
-metadata. Today a file or directory moves only if its content is local
-(written by the mount, cached in full, or inline), and is uploaded again
-under its new name; otherwise it is `EXDEV` and a copy.
+* Larger data is referred to through device slots tagged `layer/<nonce>`
+  (§3), which mounts touch like blobs.
 
 When to write snapshots, and what a garbage collector deletes, come with
 their implementation. Until then there is no `--gc`: format 1's deleted
@@ -268,5 +278,5 @@ A layer that refers to no blobs is an ordinary EROFS image, which the
 kernel's EROFS driver should mount as it is. A stack of such layers under
 overlayfs would show nearly the tree the mount shows. It would differ in
 one way: overlayfs does not know `user.gha-fs.dir`, so directories that
-were emptied would stay visible. Layers that refer to blobs need those
-blobs as extra devices. None of this is tested, and nothing depends on it.
+were emptied would stay visible. Layers that refer to blobs or other
+layers need those as extra devices. None of this is tested, and nothing depends on it.
