@@ -1,6 +1,7 @@
 # gha-cache-fusefs: layers
 
-Status: implemented, except snapshots (§8). This is format 2. It replaces
+Status: implemented, except snapshots (§8), which are specified. This is
+format 2. It replaces
 format 1's one cache entry per file, which mounts now ignore.
 
 ## 1. Why
@@ -32,6 +33,7 @@ Decisions made so far:
 | kind | key | blob |
 |---|---|---|
 | layer | `gha-fs/<volume>/layer/<nonce>` | an EROFS image (§3) |
+| snapshot | `gha-fs/<volume>/layer/<nonce>` | an EROFS image that stands in for older layers (§8) |
 | blob | `gha-fs/<volume>/blob/<sha256>` | the bytes of one large file |
 
 Keys hold no paths. Paths live in the layers, so they are no longer limited
@@ -45,10 +47,10 @@ The version, 64 hex digits, encodes:
 ```
 bytes  field
 0..8   magic  = sha256("gha-cache-fusefs/v2")[0..8]
-8      kind   1 = layer, 2 = blob
+8      kind   1 = layer, 2 = blob, 3 = snapshot
 9..12  reserved (zero)
-12..16 layers: metadata size M in 4 KiB blocks (big-endian u32); blobs: zero
-16..24 reserved (zero)
+12..16 layers and snapshots: metadata size M in 4 KiB blocks (big-endian u32); blobs: zero
+16..24 snapshots: T, what it covers (§8), in microseconds since 1970 (big-endian u64); else zero
 24..32 nonce (random)
 ```
 
@@ -118,6 +120,7 @@ the `user.` namespace, which overlayfs ignores.
 | `keep` | `mkdir`, including of a directory removed earlier | these attributes; exists even when empty |
 | `attrs` | `chmod` or `utimens` of an existing directory | these attributes |
 | `drop` | `rmdir` of a directory that a lower layer keeps | exists only while something below it does |
+| `attrs-drop` | a snapshot (§8), for a directory given attributes and then removed | these attributes; exists only while something below it does |
 
 `keep` does what format 1's directory markers do, and `drop` what their
 whiteouts do.
@@ -147,12 +150,13 @@ that wrote the layer, for debugging.
 ## 4. Stacking layers
 
 A mount lists `gha-fs/<volume>/` in each readable scope and reads the
-metadata of every layer. The layers stack as entries do in format 1
-(DESIGN.md §3.3), oldest at the bottom:
+metadata of every layer that no snapshot covers (§8). The layers stack as
+entries do in format 1 (DESIGN.md §3.3), oldest at the bottom:
 
 1. by scope: the default branch, then the pull request's base, then the
    run's own ref;
-2. within a scope, by `(created_at, id)`.
+2. within a scope, by `(created_at, id)`, with the scope's snapshot, if any,
+   below all of them.
 
 The merged tree is what applying the layers in that order gives, the way
 container runtimes apply image layers:
@@ -167,8 +171,9 @@ container runtimes apply image layers:
 * A directory's attributes come from the last layer that marks it `keep`
   or `attrs`. If no layer does, they come from the last layer that has
   it.
-* A directory exists if the last layer to mark it `keep` or `drop` said
-  `keep`, or if anything below it exists.
+* A directory exists if the last layer to mark it `keep`, `drop`, or
+  `attrs-drop` said `keep`, or if anything below it exists. (`attrs-drop`
+  sets attributes as `attrs` does.)
 
 That differs from overlayfs in one place, on purpose: an overlayfs
 whiteout hides a directory too.
@@ -229,7 +234,7 @@ did.
 ## 6. Reading layers
 
 * **Metadata**: at mount, one download URL and one ranged GET of the first
-  M blocks per layer, sixteen layers at a time.
+  M blocks per snapshot and uncovered layer, sixteen at a time.
 * **Inline data** arrives with the metadata.
 * **Plain data** is read with ranged GETs on the layer, through the sparse
   cache and readahead, with one cache per layer. Files are laid out in path
@@ -242,35 +247,95 @@ did.
   is (§3).
 
 A refresh after a lookup miss lists the layers created since the last
-listing, reads their metadata, and merges them in.
+listing, reads their metadata, and merges them in. It ignores snapshots,
+which change nothing a mount already shows.
 
 ## 7. Keeping entries alive
 
 A mount reads the metadata of every layer it stacks. That is a download,
 so it counts as use, and the layers stay alive while the volume is in use.
-Blobs are used only when read. A mount therefore touches the blobs that
-visible files refer to once they are three days stale, at most 1,000 per
-mount, the stalest first.
+Blobs, and layers a snapshot covers, are used only when read. A mount
+therefore touches the blobs and covered layers that visible files refer to
+once they are three days stale, at most 1,000 per mount, the stalest first.
+A covered layer thus lives as long as some visible file has its data.
 
 ## 8. Snapshots
 
-Layers accumulate, and since every mount reads them all, none expire. A
-**snapshot** is a layer that holds the merged tree of its scope. It records
-which layers it covers in the root xattr `user.gha-fs.covers`, a list of
-nonces rather than "everything older". That way a layer that finalized
-while the snapshot was being written is not lost.
+Without snapshots, every mount reads every layer, so none expire, and
+mounting costs more with every batch a volume ever had. A **snapshot** is a
+layer that holds what its scope's older layers stack to, and stands in for
+them.
 
-A mount reads each scope's newest snapshot and the layers it does not
-cover. Covered layers are then no longer read, so they expire unless the
-snapshot still needs their data:
+**What it covers.** A snapshot records a time T in its version (§2). It
+covers every layer of its scope created before T, and every snapshot of its
+scope with a smaller T. It covers nothing in other scopes: a run writes
+only its own.
 
-* Small files are copied into the snapshot.
-* Larger data is referred to through device slots tagged `layer/<nonce>`
-  (§3), which mounts touch like blobs.
+The writer lists its scope and takes T just after the newest layer created
+at least two minutes before the listing. A layer finalized that long before
+a listing is in it, which incremental refreshes already rely on (§6); newer
+layers stay uncovered until the next snapshot. A time is enough, and needs
+no list of layers: a list would soon outgrow what the metadata can hold,
+and a time lets a mount pick a snapshot from the listing alone. If a layer
+created before T cannot be read, T moves below it, so that no snapshot
+covers a layer its writer did not read.
 
-When to write snapshots, and what a garbage collector deletes, come with
-their implementation. Until then there is no `--gc`: format 1's deleted
-superseded entries, and in format 2 nothing is superseded as a whole.
+**Reading.** In each scope, a mount takes the listed snapshot with the
+largest T, the newest first on a tie, and reads its metadata and that of the
+scope's layers created at T or later. It does not read older snapshots or
+covered layers. The snapshot stacks below every uncovered layer of its
+scope, where the layers it covers would have been. If its metadata cannot
+be read, the mount tries the next snapshot, and after the last reads every
+layer.
+
+**Contents.** The writer stacks, in order, the snapshot its mount used, if
+any, and the layers it covers that that snapshot did not, ordered by their
+listed `(created_at, id)`. It writes the result as one layer, with what
+matters to the scopes below it:
+
+* every file and symlink the stack leaves. A file refers to its data where
+  it is (§3), whether in a layer or a blob, and inline data is copied. So a
+  snapshot holds metadata only, and never refers to another snapshot.
+* every whiteout the stack leaves: it still hides what a lower scope has
+  there. A file whose blob or layer is gone becomes a whiteout, which
+  hides a lower scope's file there but, unlike the file, not its
+  directory.
+* every directory the stack has, with its attributes and its last mark,
+  `keep` or `drop`. A directory marked `attrs` and then `drop` gets
+  `attrs-drop`, and one marked `attrs` only gets `attrs`. Directories that
+  no layer marked carry the attributes of the last layer that has them.
+
+The default branch's scope has nothing below it, so its snapshots leave out
+whiteouts and directories that do not exist, and write `attrs-drop` as
+`attrs` and leave `drop` out.
+
+**When.** A mount writes a snapshot when it unmounts, after its last layer,
+if it would cover at least 16 layers of its scope that the mount's own
+snapshot does not. That costs a listing of the scope, one creation, and an
+upload of the metadata, about 100 bytes per path. Two mounts may write
+snapshots of a scope at once. Each is complete for its T, and mounts take
+the one with the larger T.
+
+**Expiry.** Covered layers are no longer read. A covered layer that no
+visible file refers to expires a week later; one that some visible file
+still refers to stays whole, touched as blobs are (§7). Copying the files
+that survive out of a mostly overwritten layer, so that it can expire,
+is future work.
+
+**No garbage collection.** Format 1's `--gc` deleted a run's superseded
+entries, each of which held only its own data. Deleting covered layers
+instead of waiting for them to expire is not safe: other scopes may refer
+to their data. A pull request's layers and snapshots refer to data in its
+base's and the default branch's layers, and a run on those branches cannot
+see the pull request's scope, nor the touches that keep that data alive.
+So covered layers are left to expire, a week after the last mount that
+needed them touched them. Entries that hold no data, such as snapshots a
+newer one covers, could be deleted safely, but they are small, and each
+deletion costs a REST request, where a listing reads 100 entries in one.
+
+Mounts from before snapshots existed ignore kind 3 and read every layer.
+That is only right until covered layers expire, but no such mount was ever
+released.
 
 ## 9. Kernel mounting
 
