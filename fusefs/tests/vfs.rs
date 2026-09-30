@@ -1819,3 +1819,26 @@ async fn an_empty_write_past_the_end_changes_nothing() {
     drained(&a).await;
     assert_eq!(cat(&job(&server, MAIN).await.vfs, "f").await, b"abc");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renamed_directory_stays_gone_while_a_file_in_it_is_open() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    let b = a.mkdir(ROOT, "b", 0o755).unwrap();
+    write_file(&a, b.ino, "c", b"open");
+    drained(&a).await;
+
+    let j = job(&server, MAIN).await;
+    let c = lookup(&j, "b/c").await.unwrap();
+    let (fh, _) = j.open(c.ino, libc::O_RDWR).await.unwrap();
+    j.rename(ROOT, "b", ROOT, "moved", RenameMode::Replace)
+        .await
+        .unwrap();
+    // Everything commits but the open file's new name, and the whiteout of
+    // its old name, which waits for it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(ls(&j, ROOT), ["moved"]);
+    j.release(fh).unwrap();
+    drained(&j).await;
+    assert_eq!(ls(&job(&server, MAIN).await.vfs, ROOT), ["moved"]);
+}
