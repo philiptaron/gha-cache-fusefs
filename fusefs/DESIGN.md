@@ -325,7 +325,7 @@ changing one means writing it again.
 | `readdir` | Served from a snapshot taken at `opendir`/rewind, so `rm -r` does not skip entries. |
 | `mkdir` / `rmdir` | `mkdir` commits a `keep` mark, so the directory exists even when empty. `rmdir` commits a `drop` if a layer keeps the directory, which then exists only while something below it does. `ENOTEMPTY` as usual. |
 | `unlink` | Drops a pending upload. If the view shows a file there, whites it out. Open handles keep working (unlinked-but-open). |
-| `rename` | Free if the source's content is local (pending, cached in full, or inline in the metadata) or it is a symlink: the target gets a `Put`, the source a whiteout in the same layer or a later one. Directories rename if nothing below them is in the view. Otherwise `EXDEV`, so `mv` falls back to copy + unlink. `RENAME_NOREPLACE` is honored; `RENAME_EXCHANGE` is `EINVAL`. |
+| `rename` | Free if the source's content is local (pending, cached in full, or inline in the metadata) or it is a symlink: the target gets a `Put`, the source a whiteout in the same layer or a later one. A directory renames if every file below it is local in that sense: everything below it gets a `Put` under its new name (its content copied from the local cache, and a `keep` mark for each directory), and each old name a whiteout or `drop` in the same layer or a later one. Otherwise `EXDEV`, so `mv` falls back to copy + unlink. `RENAME_NOREPLACE` is honored; `RENAME_EXCHANGE` is `EINVAL`. |
 | `symlink` / `readlink` | Supported; the target lives in the layer's metadata. |
 | `chmod`, `utimens` | Committed: files are written again (copy-on-write for remote files), directories get an `attrs` mark, symlinks are written again. `chown` is accepted and ignored; ownership is always the mounting user. |
 | `link`, `mknod` (non-regular) | `EPERM`. |
@@ -387,7 +387,7 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 * **Integration tests** drive the `Vfs` core against the fake service, one
   "job" after another. They cover persistence, overwrite, copy-on-write,
   whiteouts across branch scopes and between concurrent jobs, the kinds of
-  rename (pending, cached, inline, symlink, `EXDEV`), directory marks and
+  rename (pending, cached, inline, symlink, directories, `EXDEV`), directory marks and
   attributes, symlinks, empty files, metadata, one layer per batch, blobs
   and their deduplication and loss, block uploads, ranged reads, injected
   failures, rate limits, `fsync`, refresh on lookup miss, volumes, mounting
@@ -407,8 +407,8 @@ The binary is `gha-cache-fusefs`. It reads `ACTIONS_RESULTS_URL`,
 
 * Snapshots (LAYERS.md §8): a layer holding the merged tree of its scope,
   so that the layers it covers can expire, and with them garbage collection.
-* Moving remote files and directories as metadata, once snapshots can refer
-  to data in other layers.
+* Moving uncached remote files and directories as metadata, by referring to
+  data in other layers (LAYERS.md §8).
 * Skipping unchanged uploads: `cp -a`, `tar -x`, and `rsync` of mostly
   unchanged trees rewrite every file.
 * Lazy copy-on-write: opening a remote file read-write downloads it at once,

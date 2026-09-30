@@ -254,7 +254,9 @@ snapshot still needs their data:
   which mounts touch like blobs.
 
 The same references let `mv` of a remote file or directory become
-metadata. Today it is `EXDEV` and a copy.
+metadata. Today a file or directory moves only if its content is local
+(written by the mount, cached in full, or inline), and is uploaded again
+under its new name; otherwise it is `EXDEV` and a copy.
 
 When to write snapshots, and what a garbage collector deletes, come with
 their implementation. Until then there is no `--gc`: format 1's deleted
