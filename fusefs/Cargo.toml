@@ -43,6 +43,7 @@ fuser = "0.18"
 fuser = { version = "0.18", features = ["macos-no-mount"] }
 
 [dev-dependencies]
+hegeltest = { version = "0.48.1", features = ["static-engine"] }
 tempfile = "3"
 
 [profile.release]
