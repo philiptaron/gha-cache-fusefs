@@ -10,7 +10,7 @@ use futures_util::future::try_join_all;
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 use crate::api::{Api, ApiError, CacheItem, Rest, rest::Direction, rest::PER_PAGE};
-use crate::entry::{self, DIR_XATTR, KeyKind, Kind, Mark, Version, Volume};
+use crate::entry::{self, DIR_XATTR, KeyKind, Kind, Mark, OPAQUE_XATTR, Version, Volume};
 use crate::erofs;
 
 /// A cache entry this filesystem wrote, as listed.
@@ -106,13 +106,20 @@ pub enum Stacked {
         attrs_marked: bool,
         /// The last `keep` or `drop` mark (`attrs-drop` counts as `drop`).
         mark: Option<Mark>,
+        /// A file or symlink was here after the lower layers: what they
+        /// have here and below is hidden, directories included.
+        opaque: bool,
     },
     Leaf(Node),
     /// A file whose blob or layer is gone: it hides what is below, but is
     /// not there itself.
     Gone,
-    /// A whiteout left standing: it hides what lower scopes have here.
-    Whiteout,
+    /// A whiteout left standing: it hides what lower scopes have here, and,
+    /// if it removed a file or symlink of these layers, which replaced
+    /// whatever they had, a directory too.
+    Whiteout {
+        opaque: bool,
+    },
 }
 
 /// Which node of which layer.
@@ -189,7 +196,7 @@ fn existing(tree: &BTreeMap<String, Stacked>) -> HashSet<&str> {
         let anchor = match s {
             Stacked::Leaf(_) => true,
             Stacked::Dir { mark, .. } => *mark == Some(Mark::Keep),
-            Stacked::Gone | Stacked::Whiteout => false,
+            Stacked::Gone | Stacked::Whiteout { .. } => false,
         };
         if !anchor {
             continue;
@@ -495,6 +502,7 @@ impl Index {
                 meta: default_dir_meta(),
                 attrs_marked: false,
                 mark: None,
+                opaque: false,
             },
         );
         let remove_below = |tree: &mut BTreeMap<String, Stacked>, path: &str| {
@@ -515,13 +523,31 @@ impl Index {
                     layer: layer.entry.id,
                     nid: e.nid,
                 };
+                let opaque = e.xattr(OPAQUE_XATTR).is_some();
+                if opaque {
+                    // What lower layers have here is gone, whatever it is.
+                    remove_below(&mut tree, &e.path);
+                    tree.remove(&e.path);
+                }
+                // Whether a file or symlink of these layers, which replaced
+                // whatever was here, was here last.
+                let replaced = matches!(
+                    tree.get(&e.path),
+                    Some(Stacked::Leaf(_) | Stacked::Gone | Stacked::Whiteout { opaque: true })
+                );
                 match &e.kind {
-                    _ if e.is_whiteout() => {
+                    _ if e.is_whiteout() => match tree.get(&e.path) {
                         // A directory here came from another writer.
-                        if !matches!(tree.get(&e.path), Some(Stacked::Dir { .. })) {
-                            tree.insert(e.path.clone(), Stacked::Whiteout);
+                        Some(Stacked::Dir { .. }) => {}
+                        _ => {
+                            tree.insert(
+                                e.path.clone(),
+                                Stacked::Whiteout {
+                                    opaque: opaque || replaced,
+                                },
+                            );
                         }
-                    }
+                    },
                     erofs::EntryKind::Dir => {
                         let marked = e.xattr(DIR_XATTR).and_then(Mark::parse);
                         let sets_attrs =
@@ -536,6 +562,7 @@ impl Index {
                                 meta,
                                 attrs_marked,
                                 mark,
+                                ..
                             }) => {
                                 if sets_attrs || !*attrs_marked {
                                     *meta = e.meta;
@@ -552,6 +579,7 @@ impl Index {
                                         meta: e.meta,
                                         attrs_marked: sets_attrs,
                                         mark: new_mark,
+                                        opaque: opaque || replaced,
                                     },
                                 );
                             }

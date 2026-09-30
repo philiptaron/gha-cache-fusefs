@@ -124,6 +124,14 @@ the `user.` namespace, which overlayfs ignores.
 `keep` does what format 1's directory markers do, and `drop` what their
 whiteouts do.
 
+**Opaque nodes.** A snapshot (§8) stands in for a stack of layers, in
+which a file may have replaced a lower scope's directory, and then been
+removed, or given way to a new directory. One node cannot say that, so a
+snapshot writes such a whiteout or directory with the xattr
+`user.gha-fs.opaque` (value `y`): it hides whatever lower layers have at
+and below its path, directories included, as an overlayfs opaque
+directory does. Only snapshots write it.
+
 **Devices.** Each blob or other layer a layer refers to has a device slot.
 Its `tag` is the blob's SHA-256 in hex (exactly 64 bytes), or `layer/`
 and the other layer's nonce (22 bytes, as in its key). `blocks` is the
@@ -167,6 +175,8 @@ container runtimes apply image layers:
   directory at that path came from another writer.
 * A directory merges with a directory already at its path, and replaces a
   file or symlink.
+* A whiteout or directory marked opaque first removes whatever is at and
+  below its path.
 * A directory's attributes come from the last layer that marks it `keep`
   or `attrs`. If no layer does, they come from the last layer that has
   it.
@@ -296,9 +306,10 @@ matters to the scopes below it:
   it is (§3), whether in a layer or a blob, and inline data is copied. So a
   snapshot holds metadata only, and never refers to another snapshot.
 * every whiteout the stack leaves: it still hides what a lower scope has
-  there. A file whose blob or layer is gone becomes a whiteout, which
-  hides a lower scope's file there but, unlike the file, not its
-  directory.
+  there. A file whose blob or layer is gone becomes a whiteout too.
+  Where a file or symlink of the stack was, which replaced whatever lower
+  scopes have there, the whiteout is opaque (§3), and so is a directory
+  made there after it.
 * every directory the stack has, with its attributes and its last mark,
   `keep` or `drop`. A directory marked `attrs` and then `drop` gets
   `attrs-drop`, and one marked `attrs` only gets `attrs`. Directories that
