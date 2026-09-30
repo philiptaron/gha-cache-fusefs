@@ -121,6 +121,10 @@ pub fn fresh_nonce() -> u64 {
 
 /// The xattr that marks a directory a layer changed (LAYERS.md §3).
 pub const DIR_XATTR: &str = "user.gha-fs.dir";
+/// The xattr, written only by snapshots, that makes a whiteout or a
+/// directory hide what lower layers have at and below its path,
+/// directories included (LAYERS.md §3).
+pub const OPAQUE_XATTR: &str = "user.gha-fs.opaque";
 /// The xattr on a layer's root that says who wrote it.
 pub const WRITER_XATTR: &str = "user.gha-fs.writer";
 

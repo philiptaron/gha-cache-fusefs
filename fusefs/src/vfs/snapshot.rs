@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::Vfs;
 use super::commit::{DataWriter, meta, reference, upload_image, writer};
 use crate::api::CacheItem;
-use crate::entry::{DIR_XATTR, Mark, Version, Volume, WRITER_XATTR};
+use crate::entry::{DIR_XATTR, Mark, OPAQUE_XATTR, Version, Volume, WRITER_XATTR};
 use crate::erofs::{self, FileData, Image, Node, NodeKind};
 use crate::index::{Index, Item, Layer, Listed, Node as ViewNode, Stacked, Where};
 
@@ -140,6 +140,8 @@ fn image(
     let mut image = Image::new(root);
     let mut slots: HashMap<String, u16> = HashMap::new();
     for (path, s) in tree {
+        // Below the default branch's scope there is nothing to hide.
+        let mut opaque = false;
         let (kind, meta, mark) = match s {
             Stacked::Leaf(ViewNode::File(f)) => {
                 let data = match &f.data {
@@ -165,15 +167,23 @@ fn image(
                 (NodeKind::Symlink(target.clone()), *meta, None)
             }
             Stacked::Leaf(ViewNode::Dir { .. }) => unreachable!("stacks hold directories as Dir"),
-            Stacked::Gone | Stacked::Whiteout if bottom => continue,
-            Stacked::Gone | Stacked::Whiteout => {
+            Stacked::Gone | Stacked::Whiteout { .. } if bottom => continue,
+            // A gone file replaced whatever lower scopes have here, as a
+            // file of the view does.
+            Stacked::Gone | Stacked::Whiteout { opaque: true } => {
+                opaque = true;
+                (NodeKind::Whiteout, meta(0, SystemTime::now()), None)
+            }
+            Stacked::Whiteout { opaque: false } => {
                 (NodeKind::Whiteout, meta(0, SystemTime::now()), None)
             }
             Stacked::Dir {
                 meta,
                 attrs_marked,
                 mark,
+                opaque: replaced,
             } => {
+                opaque = *replaced && !bottom;
                 let mut mark = match (attrs_marked, mark) {
                     (_, Some(Mark::Keep)) => Some(Mark::Keep),
                     (true, Some(_)) => Some(Mark::AttrsDrop),
@@ -197,6 +207,9 @@ fn image(
         let mut xattrs: Vec<(String, Vec<u8>)> = mark
             .map(|m| vec![(DIR_XATTR.to_string(), m.as_bytes().to_vec())])
             .unwrap_or_default();
+        if opaque {
+            xattrs.push((OPAQUE_XATTR.to_string(), b"y".to_vec()));
+        }
         if path.is_empty() {
             xattrs.push((WRITER_XATTR.to_string(), writer().into_bytes()));
         }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gha_cache_fusefs::api::Api;
 use gha_cache_fusefs::data::DataStore;
-use gha_cache_fusefs::entry::{Kind, Version, Volume};
+use gha_cache_fusefs::entry::{Kind, OPAQUE_XATTR, Version, Volume};
 use gha_cache_fusefs::erofs;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer, RateLimit};
 use gha_cache_fusefs::index;
@@ -1708,6 +1708,70 @@ async fn snapshots_pass_fsck() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_snapshot_hides_directories_its_files_replaced() {
+    let server = server().await;
+    let main = job(&server, MAIN).await;
+    for dir in ["gone", "remade"] {
+        let d = main.mkdir(ROOT, dir, 0o755).unwrap();
+        write_file(&main, d.ino, "old", b"main's");
+    }
+    drained(&main).await;
+    let want_main = dump(&job(&server, MAIN).await.vfs).await;
+
+    // On the branch, files replace both directories. Then one goes, and a
+    // directory takes the other's place.
+    let f = job(&server, FEATURE).await;
+    for dir in ["gone", "remade"] {
+        let d = lookup(&f, dir).await.unwrap();
+        f.unlink(d.ino, "old").unwrap();
+        f.rmdir(ROOT, dir).unwrap();
+        write_file(&f, ROOT, dir, b"a file");
+    }
+    drained(&f).await;
+    let f = job(&server, FEATURE).await;
+    f.unlink(ROOT, "gone").unwrap();
+    f.unlink(ROOT, "remade").unwrap();
+    let d = f.mkdir(ROOT, "remade", 0o700).unwrap();
+    write_file(&f, d.ino, "new", b"the branch's");
+    drained(&f).await;
+    let want = dump(&job(&server, FEATURE).await.vfs).await;
+    let new = format!("remade/new 644 12 {:x}", digest(b"the branch's"));
+    assert_eq!(want, ["remade/ 700".to_string(), new]);
+
+    // The snapshot stands in for those layers, and shows the same.
+    let s = snapshotting_job(&server, FEATURE, 2).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+    let (key, _) = snapshots(&server, FEATURE).remove(0);
+    assert_eq!(dump(&job(&server, FEATURE).await.vfs).await, want);
+    assert_eq!(dump(&job(&server, MAIN).await.vfs).await, want_main);
+
+    // It says so with opaque nodes, which erofs-utils accepts.
+    let image = server.data(&key, FEATURE).unwrap();
+    let listing = erofs::read(&image).unwrap();
+    let opaque: Vec<(&str, bool)> = listing
+        .entries
+        .iter()
+        .filter(|e| e.xattr(OPAQUE_XATTR).is_some())
+        .map(|e| (e.path.as_str(), e.is_whiteout()))
+        .collect();
+    assert_eq!(opaque, [("gone", true), ("remade", false)]);
+    if let Some(fsck) = tool("fsck.erofs") {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("snapshot"), &image).unwrap();
+        let out = Command::new(fsck)
+            .arg(dir.path().join("snapshot"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "fsck.erofs rejected the snapshot:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
