@@ -171,6 +171,15 @@ impl Volume {
         format!("{}blob/{sha256}", self.prefix)
     }
 
+    /// The tag of a device slot that refers to this entry (LAYERS.md §3):
+    /// `layer/<nonce>` for a layer, the digest for a blob.
+    pub fn device_tag(&self, key: &str) -> Option<String> {
+        match self.parse(key)? {
+            KeyKind::Layer => Some(key[self.prefix.len()..].to_string()),
+            KeyKind::Blob(sha) => Some(sha),
+        }
+    }
+
     pub fn parse(&self, key: &str) -> Option<KeyKind> {
         let rest = key.strip_prefix(&self.prefix)?;
         if let Some(nonce) = rest.strip_prefix("layer/") {
@@ -272,7 +281,9 @@ mod tests {
         let layer = v.layer_key(0xab);
         assert_eq!(layer, "gha-fs/default/layer/00000000000000ab");
         assert_eq!(v.parse(&layer), Some(KeyKind::Layer));
+        assert_eq!(v.device_tag(&layer).unwrap(), "layer/00000000000000ab");
         let sha = "c".repeat(64);
+        assert_eq!(v.device_tag(&v.blob_key(&sha)).unwrap(), sha);
         assert_eq!(v.parse(&v.blob_key(&sha)), Some(KeyKind::Blob(sha)));
         assert_eq!(v.parse("gha-fs/other/layer/00000000000000ab"), None);
         assert_eq!(v.parse("gha-fs/default/layer/xyz"), None);

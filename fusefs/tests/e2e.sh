@@ -201,10 +201,12 @@ read_phase() {
   fi
 
   log "changing files that only exist remotely"
-  ino=$(stat -c %i tarred) # all of it was read above, so it is cached
+  ino=$(stat -c %i tarred)
   t mv tarred tarred-moved
-  [ "$(stat -c %i tarred-moved)" = "$ino" ] || fail "mv of a cached remote directory copied it"
-  t mv big5 big5-moved # not cached here: EXDEV, so mv copies
+  [ "$(stat -c %i tarred-moved)" = "$ino" ] || fail "mv of a remote directory copied it"
+  ino=$(stat -c %i big5)
+  t mv big5 big5-moved # not cached here; the new layer refers to its data
+  [ "$(stat -c %i big5-moved)" = "$ino" ] || fail "mv of an uncached remote file copied it"
   same big5-moved big5 $((5 << 20))
   [ ! -e big5 ] || fail "mv left its source behind"
   echo more >>hello.txt # copy-on-write

@@ -595,6 +595,14 @@ impl RemoteFile {
         self.size
     }
 
+    /// Its bytes, if they are at hand.
+    pub fn bytes(&self) -> Option<&Arc<[u8]>> {
+        match &self.source {
+            Source::Inline(b) => Some(b),
+            Source::Range { .. } => None,
+        }
+    }
+
     /// The entry and offset it is read from, unless it is at hand.
     pub fn range_of(&self) -> Option<(&Arc<RemoteData>, u64)> {
         match &self.source {
@@ -612,14 +620,6 @@ impl RemoteFile {
     pub fn unpin(&self) {
         if let Some((rd, _)) = self.range_of() {
             rd.unpin();
-        }
-    }
-
-    /// Whether it can be read without the network.
-    pub fn present(&self) -> bool {
-        match &self.source {
-            Source::Inline(_) => true,
-            Source::Range { rd, offset } => rd.present(*offset, self.size),
         }
     }
 

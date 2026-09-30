@@ -46,7 +46,8 @@ pub enum Item {
 pub struct Layer {
     pub entry: Listed,
     pub meta_blocks: u32,
-    /// Its device slots' tags, in slot order: the blobs it refers to.
+    /// Its device slots' tags, in slot order: the blobs and layers it
+    /// refers to.
     pub devices: Vec<String>,
     /// Depth first, the root first.
     pub entries: Vec<erofs::Entry>,
@@ -148,6 +149,8 @@ pub struct Index {
     volume: Volume,
     scopes: Vec<String>,
     layers: Vec<Arc<Layer>>,
+    /// Layers by the tag a device slot refers to them with.
+    by_tag: HashMap<String, Arc<Layer>>,
     /// By digest: the entry to read a blob from.
     blobs: HashMap<String, Listed>,
     seen: HashSet<i64>,
@@ -176,6 +179,7 @@ impl Index {
             volume,
             scopes,
             layers: Vec::new(),
+            by_tag: HashMap::new(),
             blobs: HashMap::new(),
             seen: HashSet::new(),
             watermark: vec![None; n],
@@ -233,7 +237,11 @@ impl Index {
         if !self.saw(&layer.entry) {
             return false;
         }
-        self.layers.push(Arc::new(layer));
+        let layer = Arc::new(layer);
+        if let Some(tag) = self.volume.device_tag(&layer.entry.key) {
+            self.by_tag.insert(tag, layer.clone());
+        }
+        self.layers.push(layer);
         true
     }
 
@@ -462,8 +470,8 @@ impl Index {
         view
     }
 
-    /// Where a file's bytes are: `Ok(None)` if its blob is gone, and
-    /// `Err` for layouts our writer never uses.
+    /// Where a file's bytes are: `Ok(None)` if the blob or layer it refers
+    /// to is gone, and `Err` for layouts our writer never uses.
     fn locate(&self, layer: &Arc<Layer>, e: &erofs::Entry) -> Result<Option<Where>, ()> {
         match &e.data {
             erofs::Data::None => Ok(Some(Where::Inline(Arc::from(&[][..])))),
@@ -493,8 +501,14 @@ impl Index {
                         offset,
                     }));
                 }
-                let sha = layer.devices.get(first.device as usize - 1).ok_or(())?;
-                Ok(self.blobs.get(sha).map(|blob| Where::Blob {
+                let tag = layer.devices.get(first.device as usize - 1).ok_or(())?;
+                if tag.starts_with("layer/") {
+                    return Ok(self.by_tag.get(tag).map(|layer| Where::Layer {
+                        layer: layer.clone(),
+                        offset,
+                    }));
+                }
+                Ok(self.blobs.get(tag).map(|blob| Where::Blob {
                     blob: blob.clone(),
                     offset,
                 }))

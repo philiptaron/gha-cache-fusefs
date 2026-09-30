@@ -43,13 +43,15 @@ file can be used in place.
 | Reading | `cat`, `cp`, `tar`, `mmap`, random access, executing binaries |
 | Writing | any write pattern, including seeking and sparse files; `cp -a`, `tar -x`, `rsync`, `dd conv=fsync` |
 | Metadata | permission bits (so `chmod +x` survives), mtimes to the nanosecond, of files and directories; symlinks, empty files, empty directories |
-| Namespace | `mkdir`, `rmdir`, `rm`, `rm -r`, and `mv` of anything written in this job or read in full, of symlinks, of files up to 1 KiB, and of directories holding only those; `mv` of other remote files falls back to copy + delete, as across filesystems |
+| Namespace | `mkdir`, `rmdir`, `rm`, `rm -r`, and `mv` of anything, remote files and directories included, without downloading |
 | Overwrites | last writer wins; overwriting or deleting a file on a branch hides the default branch's copy on that branch only |
 | Not supported | hard links, FIFOs, device nodes, extended attributes, file ownership (always the mounting user) |
 
-Changing a file that exists only in the cache (appending, `chmod`, `truncate`,
-opening it read-write) downloads it first: entries are immutable, so every
-change writes the whole file again.
+Changing the contents of a file that exists only in the cache (appending,
+`truncate`, opening it read-write) downloads it first: entries are
+immutable, so every change writes the whole file again. Renaming it, or
+changing its mode or mtime, does not: the new layer refers to the data
+where it is.
 
 ## How it works
 

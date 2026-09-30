@@ -15,7 +15,7 @@ use super::state::{Body, Content, PendingOp, State};
 use super::{Inner, Ino};
 use crate::api::ApiError;
 use crate::api::blob::block_id;
-use crate::data::DataFile;
+use crate::data::{DataFile, RemoteFile};
 use crate::entry::{self, DIR_XATTR, Mark, Version, WRITER_XATTR};
 use crate::erofs;
 use crate::index::{self, Layer, Listed, Node as ViewNode};
@@ -49,6 +49,14 @@ enum What {
         size: u64,
         generation: u64,
     },
+    /// A file of the view under a new name or with new attributes: the
+    /// layer refers to its data where it is, or holds it if it is inline.
+    Moved {
+        ino: Ino,
+        meta: erofs::Meta,
+        rf: Arc<RemoteFile>,
+        generation: u64,
+    },
     Symlink {
         ino: Ino,
         meta: erofs::Meta,
@@ -72,6 +80,7 @@ impl What {
     fn layer_bytes(&self) -> u64 {
         match self {
             What::File { size, .. } if *size <= LAYER_FILE_MAX => *size,
+            What::Moved { rf, .. } if rf.bytes().is_some() => rf.size(),
             _ => 0,
         }
     }
@@ -306,8 +315,16 @@ fn examine(st: &State, inner: &Inner, path: &str) -> Next {
                         // Closing the file schedules it again.
                         return Next::Idle;
                     }
-                    let Content::Local(file) = &f.content else {
-                        return Next::Stale;
+                    let file = match &f.content {
+                        Content::Local(file) => file,
+                        Content::Remote(rf) => {
+                            return Next::Start(What::Moved {
+                                ino,
+                                meta: meta(f.mode, f.mtime),
+                                rf: rf.clone(),
+                                generation: f.generation,
+                            });
+                        }
                     };
                     Next::Start(What::File {
                         ino,
@@ -359,6 +376,11 @@ fn unchanged(inner: &Inner, m: &Member) -> bool {
             ino, generation, ..
         } => {
             matches!(body(ino), Some(Body::File(f)) if f.generation == *generation && f.writes_inflight == 0)
+        }
+        What::Moved {
+            ino, generation, ..
+        } => {
+            matches!(body(ino), Some(Body::File(f)) if f.generation == *generation)
         }
         _ => true,
     }
@@ -567,6 +589,38 @@ fn image(
                             pos: 0,
                         }),
                     },
+                };
+                (NodeKind::File(data), *meta, None)
+            }
+            What::Moved { meta, rf, .. } => {
+                let len = rf.size();
+                let data = match (rf.bytes(), rf.range_of()) {
+                    (Some(bytes), _) => FileData::Here {
+                        len,
+                        source: Box::new(std::io::Cursor::new(bytes.clone())),
+                    },
+                    (None, Some((rd, offset))) => {
+                        let tag = inner.cfg.volume.device_tag(&rd.entry.key).ok_or_else(|| {
+                            erofs::Error::Tree(format!("{}: not ours", rd.entry.key))
+                        })?;
+                        let device = match slots.get(&tag) {
+                            Some(d) => *d,
+                            None => {
+                                let d = image.add_device(erofs::Device {
+                                    tag: tag.clone(),
+                                    blocks: rd.size().div_ceil(erofs::BLOCK),
+                                })?;
+                                slots.insert(tag, d);
+                                d
+                            }
+                        };
+                        FileData::Device {
+                            len,
+                            device,
+                            start: offset / erofs::BLOCK,
+                        }
+                    }
+                    (None, None) => unreachable!("remote data is inline or a range"),
                 };
                 (NodeKind::File(data), *meta, None)
             }
@@ -884,7 +938,7 @@ fn finish(inner: &Arc<Inner>, batch: Batch, result: Result<Committed, ApiError>)
                 stats.uploaded_files.fetch_add(1, Ordering::Relaxed);
                 stats.uploaded_bytes.fetch_add(*size, Ordering::Relaxed);
             }
-            What::Symlink { .. } => {
+            What::Moved { .. } | What::Symlink { .. } => {
                 stats.uploaded_files.fetch_add(1, Ordering::Relaxed);
             }
             What::Dir { .. } | What::Drop { .. } => {
@@ -920,6 +974,25 @@ fn finish(inner: &Arc<Inner>, batch: Batch, result: Result<Committed, ApiError>)
                     st.make_evictable(*ino);
                 }
                 clean
+            }
+            What::Moved {
+                ino, generation, ..
+            } => {
+                // It now reads through the file this layer holds.
+                let committed = match &view {
+                    Some(ViewNode::File(f)) if ours(f.id) => Some(st.remote_file(&inner.store, f)),
+                    _ => None,
+                };
+                match st.nodes.get_mut(ino).map(|n| &mut n.body) {
+                    Some(Body::File(f)) if f.generation == *generation => {
+                        f.dirty = false;
+                        if let (Some(rf), Content::Remote(_)) = (committed, &f.content) {
+                            f.content = Content::Remote(rf);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
             }
             What::Symlink {
                 ino, generation, ..
