@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gha_cache_fusefs::api::Api;
 use gha_cache_fusefs::data::DataStore;
-use gha_cache_fusefs::entry::Volume;
+use gha_cache_fusefs::entry::{Kind, Version, Volume};
 use gha_cache_fusefs::erofs;
 use gha_cache_fusefs::fake::{FakeConfig, FakeServer, RateLimit};
 use gha_cache_fusefs::index;
@@ -1431,4 +1431,350 @@ async fn removing_a_replacement_keeps_the_original_removed() {
     drained(&b).await;
     let c = job(&server, MAIN).await;
     assert!(ls(&c, ROOT).is_empty(), "{:?}", ls(&c, ROOT));
+}
+
+/// A job that writes a snapshot at unmount once it would cover `n` layers,
+/// however new they are.
+async fn snapshotting_job(server: &FakeServer, git_ref: &str, n: usize) -> Job {
+    job_with(server, git_ref, |c| {
+        c.snapshot_after = n;
+        c.snapshot_margin = Duration::ZERO;
+    })
+    .await
+}
+
+/// The snapshots in a scope, as their keys and what they cover.
+fn snapshots(server: &FakeServer, scope: &str) -> Vec<(String, SystemTime)> {
+    let mut out: Vec<(String, SystemTime)> = entries(server, "layer")
+        .into_iter()
+        .filter_map(|(key, _)| {
+            let version = server.version(&key, scope)?;
+            match Version::decode(&version)?.kind {
+                Kind::Snapshot { covers, .. } => Some((key, covers)),
+                _ => None,
+            }
+        })
+        .collect();
+    out.sort_by_key(|(_, covers)| *covers);
+    out
+}
+
+fn digest(data: &[u8]) -> u64 {
+    data.iter()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(*b as u64))
+}
+
+/// Everything below the root, one line per path: its kind, permissions,
+/// and a digest of its content.
+async fn dump(vfs: &Vfs) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut dirs = vec![String::new()];
+    while let Some(dir) = dirs.pop() {
+        for name in ls_path(vfs, &dir).await {
+            let path = if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            };
+            let attr = lookup(vfs, &path).await.unwrap();
+            let line = match attr.kind {
+                FileKind::Dir => {
+                    dirs.push(path.clone());
+                    format!("{path}/ {:o}", attr.perm)
+                }
+                FileKind::Symlink => {
+                    format!("{path} -> {}", vfs.readlink(attr.ino).await.unwrap())
+                }
+                FileKind::File => {
+                    let data = read_file(vfs, attr.ino).await;
+                    format!("{path} {:o} {} {:x}", attr.perm, data.len(), digest(&data))
+                }
+            };
+            out.push(line);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Six layers of every kind of change, on MAIN.
+async fn six_layers(server: &FakeServer) {
+    let a = job(server, MAIN).await;
+    let d = a.mkdir(ROOT, "d", 0o750).unwrap();
+    write_file(&a, d.ino, "small", &noise(5000, 1));
+    write_file(&a, d.ino, "tiny", b"inline");
+    write_file(&a, d.ino, "big", &noise(9 << 20, 2));
+    a.symlink(d.ino, "link", "small").unwrap();
+    a.mkdir(ROOT, "empty", 0o700).unwrap();
+    write_file(&a, ROOT, "doomed", b"x");
+    drained(&a).await;
+    let b = job(server, MAIN).await;
+    b.unlink(ROOT, "doomed").unwrap();
+    b.rmdir(ROOT, "empty").unwrap();
+    let d = lookup(&b, "d").await.unwrap();
+    b.rename(d.ino, "tiny", d.ino, "tiny2", RenameMode::Replace)
+        .await
+        .unwrap();
+    b.setattr(
+        d.ino,
+        None,
+        SetAttr {
+            mode: Some(0o755),
+            ..SetAttr::default()
+        },
+    )
+    .await
+    .unwrap();
+    drained(&b).await;
+    for i in 0..4 {
+        let j = job(server, MAIN).await;
+        write_file(&j, ROOT, &format!("f{i}"), &noise(2000, 10 + i));
+        if i == 1 {
+            j.mkdir(ROOT, "kept", 0o711).unwrap();
+        }
+        drained(&j).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshots_stand_in_for_the_layers_they_cover() {
+    let server = server().await;
+    six_layers(&server).await;
+    let before = dump(&job(&server, MAIN).await.vfs).await;
+
+    let s = snapshotting_job(&server, MAIN, 4).await;
+    let summary = s.drain().await;
+    assert_eq!((summary.layers, summary.snapshots), (0, 1), "{summary:?}");
+    assert_eq!(snapshots(&server, MAIN).len(), 1);
+
+    // A mount now reads the snapshot's metadata, and nothing else.
+    let fresh = job(&server, MAIN).await;
+    assert_eq!(fresh.summary().requests.blob, 1, "{:?}", fresh.summary());
+    assert_eq!(dump(&fresh).await, before);
+
+    // Later layers stack above it, and the next snapshot covers them too.
+    let j = job(&server, MAIN).await;
+    write_file(&j, ROOT, "after", b"new");
+    j.unlink(ROOT, "f0").unwrap();
+    drained(&j).await;
+    let mut want: Vec<String> = before
+        .iter()
+        .filter(|l| !l.starts_with("f0 "))
+        .cloned()
+        .collect();
+    want.push(format!("after 644 3 {:x}", digest(b"new")));
+    want.sort();
+    assert_eq!(dump(&job(&server, MAIN).await.vfs).await, want);
+    let s = snapshotting_job(&server, MAIN, 1).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+    let snaps = snapshots(&server, MAIN);
+    assert_eq!(snaps.len(), 2);
+    assert!(snaps[0].1 < snaps[1].1);
+    let fresh = job(&server, MAIN).await;
+    assert_eq!(fresh.summary().requests.blob, 1, "only the newest snapshot");
+    assert_eq!(dump(&fresh).await, want);
+
+    // The covered layers' metadata is not needed any more, only the data
+    // they hold: without them, only files whose data is elsewhere remain.
+    for (key, _) in entries(&server, "layer") {
+        if !snaps.iter().any(|(k, _)| *k == key) {
+            server.remove(&key, MAIN);
+        }
+    }
+    let bare = job(&server, MAIN).await;
+    assert_eq!(ls(&bare, ROOT), ["after", "d", "kept"]);
+    assert_eq!(ls_path(&bare, "d").await, ["big", "link", "tiny2"]);
+    assert_eq!(cat(&bare, "d/tiny2").await, b"inline");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_snapshot_keeps_what_hides_the_default_branch() {
+    let server = server().await;
+    let main = job(&server, MAIN).await;
+    write_file(&main, ROOT, "a", b"A");
+    write_file(&main, ROOT, "b", b"B");
+    let d = main.mkdir(ROOT, "d", 0o755).unwrap();
+    write_file(&main, d.ino, "f", b"F");
+    drained(&main).await;
+
+    let f = job(&server, FEATURE).await;
+    f.unlink(ROOT, "a").unwrap();
+    let d = lookup(&f, "d").await.unwrap();
+    f.setattr(
+        d.ino,
+        None,
+        SetAttr {
+            mode: Some(0o700),
+            ..SetAttr::default()
+        },
+    )
+    .await
+    .unwrap();
+    drained(&f).await;
+    // Given attributes, and then removed: attrs-drop in the snapshot.
+    let f = job(&server, FEATURE).await;
+    let d = lookup(&f, "d").await.unwrap();
+    f.unlink(d.ino, "f").unwrap();
+    f.rmdir(ROOT, "d").unwrap();
+    drained(&f).await;
+    for i in 0..2 {
+        let f = job(&server, FEATURE).await;
+        write_file(&f, ROOT, &format!("x{i}"), b"x");
+        drained(&f).await;
+    }
+    let s = snapshotting_job(&server, FEATURE, 4).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+
+    let f = job(&server, FEATURE).await;
+    assert_eq!(
+        f.summary().requests.blob,
+        2,
+        "main's layer and the snapshot"
+    );
+    assert_eq!(ls(&f, ROOT), ["b", "x0", "x1"]);
+    let m = job(&server, MAIN).await;
+    assert_eq!(ls(&m, ROOT), ["a", "b", "d"]);
+    // The drop still says d exists only while something is in it.
+    let d = lookup(&m, "d").await.unwrap();
+    write_file(&m, d.ino, "g", b"G");
+    drained(&m).await;
+    let f = job(&server, FEATURE).await;
+    assert_eq!(ls(&f, ROOT), ["b", "d", "x0", "x1"]);
+    assert_eq!(ls_path(&f, "d").await, ["g"]);
+    assert_eq!(lookup(&f, "d").await.unwrap().perm, 0o700);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshots_pass_fsck() {
+    let Some(fsck) = tool("fsck.erofs") else {
+        eprintln!("skipping: fsck.erofs is not on PATH");
+        return;
+    };
+    let server = server().await;
+    six_layers(&server).await;
+    let s = snapshotting_job(&server, MAIN, 4).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+    // Each device is a file of its own, named by its tag.
+    let dir = tempfile::tempdir().unwrap();
+    let device = |tag: &str| dir.path().join(tag.replace('/', "-"));
+    let volume = Volume::new("default").unwrap();
+    for (key, _) in [entries(&server, "layer"), entries(&server, "blob")].concat() {
+        let tag = volume.device_tag(&key).unwrap();
+        std::fs::write(device(&tag), server.data(&key, MAIN).unwrap()).unwrap();
+    }
+    let (key, _) = snapshots(&server, MAIN).remove(0);
+    let image = server.data(&key, MAIN).unwrap();
+    let listing = erofs::read(&image).unwrap();
+    assert!(listing.devices.len() >= 2, "a blob and layers");
+    let mut cmd = Command::new(&fsck);
+    for (tag, _) in &listing.devices {
+        cmd.arg(format!("--device={}", device(tag).display()));
+    }
+    let out = cmd
+        .arg(device(&volume.device_tag(&key).unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fsck.erofs rejected the snapshot:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_branch_snapshot_leaves_out_what_hides_nothing() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "x", b"x");
+    a.mkdir(ROOT, "z", 0o755).unwrap();
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    b.unlink(ROOT, "x").unwrap();
+    b.rmdir(ROOT, "z").unwrap();
+    drained(&b).await;
+    let c = job(&server, MAIN).await;
+    write_file(&c, ROOT, "y", b"y");
+    drained(&c).await;
+    let s = snapshotting_job(&server, MAIN, 3).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+    let (key, _) = snapshots(&server, MAIN).remove(0);
+    let listing = erofs::read(&server.data(&key, MAIN).unwrap()).unwrap();
+    let paths: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["", "y"]);
+    assert!(listing.devices.is_empty(), "y is inline");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_stops_before_a_layer_it_cannot_read() {
+    let server = server().await;
+    for i in 0..2 {
+        let j = job(&server, MAIN).await;
+        write_file(&j, ROOT, &format!("f{i}"), b"x");
+        drained(&j).await;
+    }
+    // A layer from some later version of the tool.
+    let volume = Volume::new("default").unwrap();
+    let version = Version::layer(1);
+    server.insert(
+        &volume.layer_key(version.nonce),
+        &version.encode(),
+        MAIN,
+        bytes::Bytes::from(vec![0xa5u8; 4096]),
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for i in 2..4 {
+        let j = job(&server, MAIN).await;
+        write_file(&j, ROOT, &format!("f{i}"), b"x");
+        drained(&j).await;
+    }
+    let s = snapshotting_job(&server, MAIN, 2).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+    let (key, _) = snapshots(&server, MAIN).remove(0);
+    let listing = erofs::read(&server.data(&key, MAIN).unwrap()).unwrap();
+    let paths: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["", "f0", "f1"]);
+    let fresh = job(&server, MAIN).await;
+    assert_eq!(ls(&fresh, ROOT), ["f0", "f1", "f2", "f3"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn covered_layers_live_while_visible_files_need_them() {
+    let server = server().await;
+    let a = job(&server, MAIN).await;
+    write_file(&a, ROOT, "kept", &noise(5000, 1));
+    drained(&a).await;
+    let b = job(&server, MAIN).await;
+    write_file(&b, ROOT, "replaced", &noise(5000, 2));
+    drained(&b).await;
+    let c = job(&server, MAIN).await;
+    c.unlink(ROOT, "replaced").unwrap();
+    drained(&c).await;
+    let layer_keys: Vec<String> = entries(&server, "layer")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let s = snapshotting_job(&server, MAIN, 3).await;
+    assert_eq!(s.drain().await.snapshots, 1);
+
+    server.age(Duration::from_secs(4 * 24 * 3600));
+    let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+    let again = job(&server, MAIN).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while again.summary().touched < 1 {
+        assert!(Instant::now() < deadline, "{:?}", again.summary());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(again.summary().touched, 1);
+    // The layer that holds "kept" was touched; the others were not.
+    for key in &layer_keys {
+        let used = server.last_used(key, MAIN).unwrap() > stale;
+        let holds_kept = erofs::read(&server.data(key, MAIN).unwrap())
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.path == "kept");
+        assert_eq!(used, holds_kept, "{key}");
+    }
 }

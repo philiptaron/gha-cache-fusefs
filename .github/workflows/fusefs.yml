@@ -139,6 +139,12 @@ jobs:
           binary: bin/gha-cache-fusefs
           settle: 200ms
           log: info,gha_cache_fusefs=debug
+        env:
+          # So that unmounting writes a snapshot of the write job's layers,
+          # which the verify job then mounts from. They are minutes old, and
+          # on the real service the write job makes about ten.
+          GHA_CACHE_FUSEFS_SNAPSHOT_MARGIN: 5s
+          GHA_CACHE_FUSEFS_SNAPSHOT_AFTER: 4
       - run: bash fusefs/tests/e2e.sh read
         env:
           MNT: /mnt/cache
@@ -157,12 +163,15 @@ jobs:
           path: bin
       - run: chmod +x bin/gha-cache-fusefs
       - uses: ./mount
+        id: mount
         with:
           path: /mnt/cache
           volume: ${{ env.VOLUME }}
           binary: bin/gha-cache-fusefs
           settle: 200ms
           log: info,gha_cache_fusefs=debug
+      - name: The mount read the read job's snapshot
+        run: grep -E ' [1-9][0-9]* snapshots read' '${{ steps.mount.outputs.state-dir }}/daemon.log'
       - run: bash fusefs/tests/e2e.sh verify
         env:
           MNT: /mnt/cache

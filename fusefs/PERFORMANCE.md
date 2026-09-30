@@ -34,8 +34,8 @@ they led to carry over.
 * **Mounting costs one REST request per 100 layers and blobs** per scope,
   plus a download URL and a ranged GET per layer. 20,000 files in 20 layers
   mount in 1.3 s with one REST request, where format 1 took 7.2 s and 200.
-  But layers are never dropped yet, so this grows with a volume's history
-  until snapshots exist (§5).
+  Once a snapshot covers them, the same mount reads one entry's metadata
+  instead of 20, in 0.9 s, and stops growing with the volume's history.
 * The benchmarks also turned up problems in the daemon, since fixed. A 429
   paused reads as well as writes: a cold read waited 26.5 s instead of
   0.5 s (§4.5). Writing *n* files cost O(*n*²) locally, 20 s for 20,000
@@ -102,9 +102,10 @@ Several consequences follow.
   fetches them all in 8 MiB requests.
 * **A cold random read of 4 KiB fetches its 1 MiB chunk**: one round trip
   plus 45 ms of transfer.
-* **Mount time and REST cost grow with every layer**, including layers
-  whose files later layers replaced or deleted, until snapshots let old
-  layers expire.
+* **Mount time grows with every layer that no snapshot covers.** A mount
+  reads a scope's newest snapshot and the layers since; a job whose scope
+  has 16 such layers writes a new snapshot when it unmounts, at the cost of
+  a listing of the scope, a creation, and an upload of metadata only.
 
 Format 1 made every file, symlink, empty directory, and deletion an entry
 of its own. At 4.4 creations/s, each used 0.23 s of the sustained budget,
@@ -137,6 +138,8 @@ step's own requests cannot be told apart from others in the same job.
 | small | stat them all (ls -lR) | 0.78 ms | 0.8 µs per entry | 0 / 0 / 0 | – |
 | small | remove them (rm -r, unmount) | 799 ms | 1251.1 whiteouts/s | 2 / 1 / 0 | – |
 | mount | list 20 layers, read their metadata, and build the tree of 20000 files | 1.3 s | 14993.3 files/s | 20 / 20 / 1 | – |
+| mount | write a snapshot of the 20 layers (unmount) | 1.4 s | | 2 / 1 / 2 | – |
+| mount | the same mount, from the snapshot | 916 ms | 21827.4 files/s | 1 / 1 / 1 | – |
 | mount | stack 200000 files in 200 layers and build the tree (CPU only) | 238 ms | 1.2 µs per file | – | – |
 | throttled | write and fsync files in 6 jobs until the first 429 | 25.5 s | 198 layers | 67 / 34 / 0 | – |
 | throttled | a cold 4 KiB read in one of them | 255 ms | | – | – |
@@ -339,8 +342,9 @@ In format 1, mounting 20,000 entries took 7.0 s and 200 REST requests: a
 fifth of the repository's hourly budget, per scope, per mount. On a pull
 request with three scopes, three such mounts used the whole hour. In
 format 2, 20,000 files written in batches of 1,000 are 20 layers, one REST
-request (§4.1). The listing now grows with the number of batches, and
-until snapshots exist (§5), with every batch the volume ever had. Lookups of missing names
+request (§4.1). The listing still grows with the entries the service
+keeps, but covered layers that nothing refers to expire a week after a
+snapshot covers them. Lookups of missing names
 re-list at most every 15 s, which is up to 240 refreshes an hour per scope.
 Compilers probing include paths, Python probing for modules, and `git`
 looking for `.git` all look up missing names.
@@ -368,10 +372,12 @@ Packing small objects into shared entries, the first lever of this
 analysis, became format 2. These are ordered by how much of what remains
 they would remove.
 
-* **Snapshots** (LAYERS.md §8). Every mount reads every layer, and nothing
-  lets old layers go, so mount time and REST cost grow with a volume's
-  history. A snapshot holds the merged tree of its scope, and mounts read
-  only the layers it does not cover.
+* **Compaction.** A covered layer stays alive, whole, while any visible
+  file refers to its data (LAYERS.md §8). Copying the surviving files of a
+  mostly overwritten layer into a snapshot would let the layer expire.
+* **Not garbage collection.** Deleting covered layers, rather than
+  waiting a week for them to expire, would free quota sooner, but a run
+  cannot tell whether another scope refers to their data (LAYERS.md §8).
 * **Not pipelining layers.** Creating and uploading the next layer while
   the previous one finalizes looked like it would take a mount from 1.3
   layers a second to about 4. It would not help the program it was for: an

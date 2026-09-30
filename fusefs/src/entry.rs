@@ -5,6 +5,7 @@
 //! Keys hold no paths. The 64-hex-digit version says which kind an entry is.
 
 use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -20,6 +21,12 @@ pub enum Kind {
         meta_blocks: u32,
     },
     Blob,
+    /// A layer that stands in for the layers of its scope created before
+    /// `covers` (LAYERS.md §8).
+    Snapshot {
+        meta_blocks: u32,
+        covers: SystemTime,
+    },
 }
 
 /// What an entry's version encodes.
@@ -45,6 +52,16 @@ impl Version {
         }
     }
 
+    pub fn snapshot(meta_blocks: u32, covers: SystemTime) -> Version {
+        Version {
+            kind: Kind::Snapshot {
+                meta_blocks,
+                covers,
+            },
+            nonce: fresh_nonce(),
+        }
+    }
+
     /// 64 lowercase hex digits.
     pub fn encode(&self) -> String {
         let mut raw = [0u8; 32];
@@ -55,6 +72,17 @@ impl Version {
                 raw[12..16].copy_from_slice(&meta_blocks.to_be_bytes());
             }
             Kind::Blob => raw[8] = 2,
+            Kind::Snapshot {
+                meta_blocks,
+                covers,
+            } => {
+                raw[8] = 3;
+                raw[12..16].copy_from_slice(&meta_blocks.to_be_bytes());
+                let micros = covers
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as u64);
+                raw[16..24].copy_from_slice(&micros.to_be_bytes());
+            }
         }
         raw[24..32].copy_from_slice(&self.nonce.to_be_bytes());
         hex::encode(raw)
@@ -75,6 +103,11 @@ impl Version {
                 meta_blocks: u32::from_be_bytes(raw[12..16].try_into().ok()?),
             },
             2 => Kind::Blob,
+            3 => Kind::Snapshot {
+                meta_blocks: u32::from_be_bytes(raw[12..16].try_into().ok()?),
+                covers: UNIX_EPOCH
+                    + Duration::from_micros(u64::from_be_bytes(raw[16..24].try_into().ok()?)),
+            },
             _ => return None,
         };
         let nonce = u64::from_be_bytes(raw[24..32].try_into().ok()?);
@@ -100,6 +133,9 @@ pub enum Mark {
     Attrs,
     /// Removed with `rmdir`: it exists only while something below it does.
     Drop,
+    /// Written by snapshots, for `attrs` and then `drop`: these attributes,
+    /// and it exists only while something below it does.
+    AttrsDrop,
 }
 
 impl Mark {
@@ -108,6 +144,7 @@ impl Mark {
             Mark::Keep => b"keep",
             Mark::Attrs => b"attrs",
             Mark::Drop => b"drop",
+            Mark::AttrsDrop => b"attrs-drop",
         }
     }
 
@@ -116,6 +153,7 @@ impl Mark {
             b"keep" => Some(Mark::Keep),
             b"attrs" => Some(Mark::Attrs),
             b"drop" => Some(Mark::Drop),
+            b"attrs-drop" => Some(Mark::AttrsDrop),
             _ => None,
         }
     }
@@ -244,7 +282,15 @@ mod tests {
 
     #[test]
     fn versions_round_trip() {
-        for kind in [Kind::Layer { meta_blocks: 7 }, Kind::Blob] {
+        let covers = UNIX_EPOCH + Duration::from_micros(1_790_000_000_123_456);
+        for kind in [
+            Kind::Layer { meta_blocks: 7 },
+            Kind::Blob,
+            Kind::Snapshot {
+                meta_blocks: 9,
+                covers,
+            },
+        ] {
             let v = Version {
                 kind,
                 nonce: 0xdead_beef_cafe_f00d,

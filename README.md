@@ -91,9 +91,12 @@ service with `actions/cache/save` and `actions/cache/restore`.
 * Runs whose cache token is read-only (for example, some pull requests from
   forks) are mounted read-only.
 * The cache service's limits apply: the repository's cache quota (10 GB by
-  default) and eviction after 7 days without access. Every mount reads every
-  layer, which keeps a volume in use alive; old layers are never dropped
-  yet, so a volume only grows. Creating entries is rate limited, to about
+  default) and eviction after 7 days without access. A mount reads each
+  scope's newest snapshot and the layers written since, which keeps a
+  volume in use alive; a job that finds 16 layers of its own scope since
+  the last snapshot writes a new one when it unmounts
+  (`GHA_CACHE_FUSEFS_SNAPSHOT_AFTER`, 0 to never). Older layers then expire
+  once no visible file needs their data. Creating entries is rate limited, to about
   200 per ~45 s per repository. A batch of changes is one entry however
   many files it has, so this only matters for many files over 8 MiB, or
   with `fsync: commit` for programs that `fsync` every file; the daemon

@@ -71,6 +71,13 @@ struct MountArgs {
     /// (`commit`).
     #[arg(long, env = "GHA_CACHE_FUSEFS_FSYNC", value_enum, default_value_t = Fsync::Local)]
     fsync: Fsync,
+    /// At unmount, write a snapshot of this run's scope if it would cover
+    /// at least this many layers, so that mounts read fewer (0: never).
+    #[arg(long, env = "GHA_CACHE_FUSEFS_SNAPSHOT_AFTER", default_value_t = 16)]
+    snapshot_after: usize,
+    /// How old a layer must be for a snapshot to cover it (for tests).
+    #[arg(long, env = "GHA_CACHE_FUSEFS_SNAPSHOT_MARGIN", default_value = "2m", value_parser = humantime::parse_duration, hide = true)]
+    snapshot_margin: Duration,
     /// Minimum interval between re-listings triggered by lookup misses (0 disables).
     #[arg(long, default_value = "15s", value_parser = humantime::parse_duration)]
     refresh: Duration,
@@ -392,6 +399,8 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
             .map_err(anyhow::Error::msg)?;
         cfg.read_only = read_only;
         cfg.settle = args.settle;
+        cfg.snapshot_after = args.snapshot_after;
+        cfg.snapshot_margin = args.snapshot_margin;
         cfg.fsync = match args.fsync {
             Fsync::Local => FsyncMode::Local,
             Fsync::Commit => FsyncMode::Commit,
@@ -430,13 +439,14 @@ fn serve(args: &MountArgs, state_dir: &Path, ready: &mut Ready) -> anyhow::Resul
         &serde_json::to_vec_pretty(&summary)?,
     )?;
     tracing::info!(
-        "uploaded {} files ({} bytes), {} whiteouts, and {} directory marks in {} layers and {} blobs; {} failures",
+        "uploaded {} files ({} bytes), {} whiteouts, and {} directory marks in {} layers and {} blobs, and {} snapshots; {} failures",
         summary.uploaded_files,
         summary.uploaded_bytes,
         summary.whiteouts,
         summary.dir_markers,
         summary.layers,
         summary.blobs,
+        summary.snapshots,
         summary.failures.len()
     );
     for f in &summary.failures {

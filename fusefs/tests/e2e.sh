@@ -155,7 +155,10 @@ write_phase() {
 }
 
 read_phase() {
-  mount_fs
+  # So that unmounting writes a snapshot of the write phase's layers, which
+  # the verify phase then mounts from. This mount is its fake service's only
+  # writer, so no margin is needed.
+  GHA_CACHE_FUSEFS_SNAPSHOT_MARGIN=0s GHA_CACHE_FUSEFS_SNAPSHOT_AFTER=4 mount_fs
   cd "$D"
   log "contents survive"
   [ "$(cat hello.txt)" = "hello, world" ] || fail hello.txt
@@ -214,6 +217,9 @@ read_phase() {
   t rm -r copied
   rmdir emptydir
   unmount_fs
+  if [ -z "${EXTERNAL_MOUNT:-}" ]; then
+    grep -q '"snapshots": 1' "$WORK/summary.json" || fail "no snapshot was written"
+  fi
 }
 
 verify_phase() {
